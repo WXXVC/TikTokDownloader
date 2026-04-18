@@ -1,0 +1,679 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NEWWEB Downloader Panel</title>
+  <link rel="stylesheet" href="/webui-static/styles.css" />
+</head>
+<body class="auth-locked">
+  <div id="auth-gate" class="auth-gate">
+    <div class="auth-card">
+      <div class="auth-badge">受限访问</div>
+      <h1>请输入访问密码</h1>
+      <p>只有输入正确密码后，才可以进入当前页面。</p>
+      <form id="auth-form" class="auth-form">
+        <label class="field-label auth-field">
+          <span>访问密码</span>
+          <input id="auth-password" name="password" type="password" inputmode="numeric" autocomplete="current-password" placeholder="请输入密码" required />
+        </label>
+        <p id="auth-error" class="auth-error" hidden>密码错误，请重试。</p>
+        <button type="submit" id="auth-submit">进入页面</button>
+      </form>
+    </div>
+  </div>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <h1>TKWEB</h1>
+      <p>TikTokDownloader 控制台</p>
+      <nav>
+        <button class="nav-link active" data-view="dashboard">总览</button>
+        <button class="nav-link" data-view="creators">账号管理</button>
+        <button class="nav-link" data-view="profiles">下载配置</button>
+        <button class="nav-link" data-view="engine-config">引擎配置</button>
+        <button class="nav-link" data-view="scan">扫描结果</button>
+        <button class="nav-link" data-view="tasks">任务中心</button>
+      </nav>
+    </aside>
+    <main class="content">
+      <div id="network-status" class="network-status" hidden>
+        <span id="network-status-text">空闲</span>
+      </div>
+      <section id="dashboard" class="view active">
+        <div class="panel">
+          <h2>系统状态</h2>
+          <div id="health-grid" class="stats-grid"></div>
+        </div>
+      </section>
+
+      <section id="creators" class="view">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>账号管理</h2>
+            <div class="creator-quick-add-inline">
+              <textarea id="creator-quick-add-url" placeholder="每行一个账号主页链接，支持批量粘贴后连续新增"></textarea>
+              <button id="creator-quick-add-submit" type="button">一键增加账号</button>
+            </div>
+            <div class="actions">
+              <button id="retry-failed-creators-page" type="button" class="ghost-button">重试本页失败账号</button>
+              <button id="open-creator-create" type="button">新增账号</button>
+              <button id="refresh-creators" type="button">刷新</button>
+            </div>
+          </div>
+          <div class="creator-toolbar creator-toolbar-compact">
+            <input id="creator-filter-keyword" placeholder="搜索名称、别名、链接" />
+            <select id="creator-filter-platform">
+              <option value="">全部平台</option>
+              <option value="douyin">抖音</option>
+              <option value="tiktok">TikTok</option>
+            </select>
+            <select id="creator-filter-profile">
+              <option value="">全部配置</option>
+            </select>
+            <select id="creator-filter-enabled">
+              <option value="">全部状态</option>
+              <option value="true">仅启用</option>
+              <option value="false">仅停用</option>
+            </select>
+            <select id="creator-filter-auto">
+              <option value="">全部自动下载</option>
+              <option value="true">仅自动开启</option>
+              <option value="false">仅自动关闭</option>
+            </select>
+            <select id="creator-filter-auto-status">
+              <option value="">全部自动结果</option>
+              <option value="failed">仅最近失败</option>
+              <option value="success">仅最近成功</option>
+              <option value="empty">仅暂无记录</option>
+            </select>
+          </div>
+          <div class="list-toolbar">
+            <label>
+              每页
+              <select id="creators-page-size">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+              </select>
+              条
+            </label>
+            <div id="creators-pagination" class="pagination"></div>
+          </div>
+          <div id="creators-table" class="creator-grid"></div>
+        </div>
+      </section>
+
+      <section id="profiles" class="view">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>下载配置</h2>
+            <div class="actions">
+              <button id="open-profile-create" type="button">新增配置</button>
+              <button id="refresh-profiles" type="button">刷新</button>
+            </div>
+          </div>
+          <div class="creator-toolbar">
+            <input id="profile-filter-keyword" placeholder="搜索配置名称、目录、命名格式" />
+            <select id="profile-filter-enabled">
+              <option value="">全部状态</option>
+              <option value="true">仅启用</option>
+              <option value="false">仅停用</option>
+            </select>
+          </div>
+          <div class="list-toolbar">
+            <label>
+              每页
+              <select id="profiles-page-size">
+                <option value="20">20</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+              </select>
+              条
+            </label>
+            <div id="profiles-pagination" class="pagination"></div>
+          </div>
+          <div id="profiles-table" class="creator-grid"></div>
+        </div>
+      </section>
+
+      <section id="engine-config" class="view">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>引擎配置</h2>
+            <div class="actions">
+              <button id="reload-engine-config" type="button" class="ghost-button">重新读取</button>
+              <button id="save-engine-config" type="button">保存到 settings.json</button>
+            </div>
+          </div>
+          <div class="summary">
+            这里维护原项目 <code>settings.json</code> 中尚未被账号管理、下载配置接管的全局运行参数。
+          </div>
+          <form id="engine-config-form" class="engine-config-layout">
+            <section class="engine-config-group">
+              <h3>基础参数</h3>
+              <div class="engine-form-grid">
+                <label class="field-label engine-field">
+                  <span>作品描述长度</span>
+                  <input name="desc_length" type="number" min="0" placeholder="64" />
+                  <small class="field-help">限制作品描述参与文件名时的最大长度。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>文件名长度上限</span>
+                  <input name="name_length" type="number" min="0" placeholder="128" />
+                  <small class="field-help">最终生成的文件名最大长度，避免系统报错。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>截断长度</span>
+                  <input name="truncate" type="number" min="0" placeholder="50" />
+                  <small class="field-help">超长文本被裁切时，每段保留的长度。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>日期格式</span>
+                  <select name="date_format">
+                    <option value="%Y-%m-%d %H:%M:%S">%Y-%m-%d %H:%M:%S</option>
+                    <option value="%Y-%m-%d">%Y-%m-%d</option>
+                    <option value="%Y-%m">%Y-%m</option>
+                  </select>
+                  <small class="field-help">控制时间字段写入文件名或导出数据时的显示格式。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>命名分隔符</span>
+                  <input name="split" placeholder="-" />
+                  <small class="field-help">文件名各模块之间的连接符，例如短横线或下划线。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>存储格式</span>
+                  <input name="storage_format" placeholder="如 sqlite / csv" />
+                  <small class="field-help">控制引擎下载记录和导出数据的存储方式。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>默认 run_command</span>
+                  <input name="run_command" placeholder="例如 7" />
+                  <small class="field-help">原项目启动时的默认命令编号，通常保持现状即可。</small>
+                </label>
+              </div>
+            </section>
+
+            <section class="engine-config-group">
+              <h3>网络与重试</h3>
+              <div class="engine-form-grid">
+                <label class="field-label engine-field">
+                  <span>抖音代理</span>
+                  <input name="proxy" placeholder="http://127.0.0.1:7890" />
+                  <small class="field-help">抖音请求走的代理地址，不用代理就留空。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>TikTok 代理</span>
+                  <input name="proxy_tiktok" placeholder="http://127.0.0.1:7890" />
+                  <small class="field-help">TikTok 请求走的代理地址，海外访问常会用到。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>TikTok twc_tiktok</span>
+                  <input name="twc_tiktok" placeholder="可留空" />
+                  <small class="field-help">TikTok 侧的附加鉴权参数，通常不手动改。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>超时秒数</span>
+                  <input name="timeout" type="number" min="0" placeholder="10" />
+                  <small class="field-help">单次网络请求等待多久后判定超时。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>最大重试次数</span>
+                  <input name="max_retry" type="number" min="0" placeholder="5" />
+                  <small class="field-help">请求失败后自动重试的次数。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>最大分页数</span>
+                  <input name="max_pages" type="number" min="0" placeholder="0 表示不限" />
+                  <small class="field-help">扫描账号时最多翻多少页，0 表示不限制。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>最大文件体积</span>
+                  <input name="max_size" type="number" min="0" placeholder="0 表示不限" />
+                  <small class="field-help">限制可下载文件大小，0 表示不限制。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>分块大小</span>
+                  <input name="chunk" type="number" min="0" placeholder="2097152" />
+                  <small class="field-help">下载文件时每次读取的块大小，通常保持默认即可。</small>
+                </label>
+              </div>
+            </section>
+
+            <section class="engine-config-group">
+              <h3>一键添加默认配置</h3>
+              <div class="engine-form-grid">
+                <label class="field-label engine-field">
+                  <span>默认下载配置</span>
+                  <select name="quick_add_profile_id" id="engine-quick-add-profile-select"></select>
+                  <small class="field-help">账号页使用“一键增加账号”时，默认选用这个下载配置。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>默认下载类型</span>
+                  <select name="quick_add_tab">
+                    <option value="post">发布作品</option>
+                    <option value="favorite">喜欢作品</option>
+                    <option value="collection">收藏作品</option>
+                  </select>
+                  <small class="field-help">新账号默认读取哪个分栏。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>默认自动下载</span>
+                  <label class="checkbox field-checkbox"><input name="quick_add_auto_download_enabled" type="checkbox" />新增账号时同步开启定时自动下载</label>
+                </label>
+                <label class="field-label engine-field">
+                  <span>默认执行周期</span>
+                  <div class="compound-field">
+                    <input name="quick_add_auto_download_interval_value" type="number" min="0" step="1" placeholder="如 6" />
+                    <select name="quick_add_auto_download_interval_unit">
+                      <option value="m">分钟</option>
+                      <option value="h">小时</option>
+                      <option value="d">天</option>
+                    </select>
+                  </div>
+                  <small class="field-help">只有开启默认自动下载时才会生效。</small>
+                </label>
+              </div>
+            </section>
+
+            <section class="engine-config-group">
+              <h3>自动下载防过频暂停</h3>
+              <div class="engine-form-grid">
+                <label class="checkbox field-checkbox engine-switch"><input name="auto_download_scheduler_enabled" type="checkbox" />开启全局自动下载调度</label>
+                <label class="field-label engine-field">
+                  <span>暂停模式</span>
+                  <select name="auto_download_pause_mode">
+                    <option value="works">按作品数暂停</option>
+                    <option value="creators">按账号数暂停</option>
+                  </select>
+                  <small class="field-help">总开关关闭时，不会自动扫描或自动启动队列里的账号任务。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>作品数阈值</span>
+                  <input name="auto_download_pause_after_works" type="number" min="0" placeholder="1000" />
+                  <small class="field-help">按作品数模式下，累计下载多少作品后暂停。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>账号数阈值</span>
+                  <input name="auto_download_pause_after_creators" type="number" min="0" placeholder="10" />
+                  <small class="field-help">按账号数模式下，累计处理多少账号后暂停。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>暂停分钟数</span>
+                  <input name="auto_download_pause_minutes" type="number" min="1" placeholder="5" />
+                  <small class="field-help">触发暂停后，等待多久再自动恢复。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>自动下载批次大小</span>
+                  <input name="auto_download_work_batch_size" type="number" min="1" placeholder="20" />
+                  <small class="field-help">每个账号一轮扫描后，单个自动下载任务最多包含多少个作品。</small>
+                </label>
+              </div>
+            </section>
+
+            <section class="engine-config-group">
+              <h3>页面访问</h3>
+              <div class="engine-form-grid">
+                <label class="field-label engine-field">
+                  <span>访问密码</span>
+                  <input name="access_password" type="text" placeholder="请输入页面访问密码" />
+                  <small class="field-help">进入面板首页前需要输入的密码，保存后立即生效。</small>
+                </label>
+              </div>
+            </section>
+
+            <section class="engine-config-group">
+              <h3>风控兜底</h3>
+              <div class="engine-form-grid">
+                <label class="checkbox field-checkbox engine-switch"><input name="risk_guard_enabled" type="checkbox" />开启 24 小时风控暂停</label>
+                <label class="field-label engine-field">
+                  <span>冷却小时数</span>
+                  <input name="risk_guard_cooldown_hours" type="number" min="1" placeholder="24" />
+                  <small class="field-help">命中风控后暂停多久再自动恢复。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>连续 HTTP 异常次数</span>
+                  <input name="risk_guard_http_error_streak" type="number" min="1" placeholder="3" />
+                  <small class="field-help">连续请求异常达到多少次后触发风控暂停。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>命中状态码</span>
+                  <input name="risk_guard_status_codes" placeholder="403,429" />
+                  <small class="field-help">这些状态码连续出现时也会视为风控信号。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>连续空地址次数</span>
+                  <input name="risk_guard_empty_download_streak" type="number" min="1" placeholder="3" />
+                  <small class="field-help">下载地址连续为空达到阈值时触发暂停。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>连续低清晰批次数</span>
+                  <input name="risk_guard_low_quality_streak" type="number" min="1" placeholder="3" />
+                  <small class="field-help">连续出现低清晰结果多少批后触发暂停。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>低清晰占比阈值</span>
+                  <input name="risk_guard_low_quality_ratio" type="number" min="0" max="1" step="0.05" placeholder="0.8" />
+                  <small class="field-help">一批下载中低清晰结果占比达到多少算异常。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>低清晰最大边</span>
+                  <input name="risk_guard_low_quality_max_dimension" type="number" min="1" placeholder="720" />
+                  <small class="field-help">分辨率最大边不超过这个值时，视作低清晰。</small>
+                </label>
+              </div>
+            </section>
+
+            <section class="engine-config-group">
+              <h3>开关项</h3>
+              <div class="engine-switch-grid">
+                <label class="checkbox field-checkbox engine-switch"><input name="download" type="checkbox" />启用下载</label>
+                <label class="checkbox field-checkbox engine-switch"><input name="douyin_platform" type="checkbox" />启用抖音平台</label>
+                <label class="checkbox field-checkbox engine-switch"><input name="tiktok_platform" type="checkbox" />启用 TikTok 平台</label>
+              </div>
+            </section>
+
+            <section class="engine-config-group">
+              <h3>Cookie</h3>
+              <div class="engine-textarea-grid">
+                <label class="field-label field-label-wide">
+                  <span>抖音 Cookie</span>
+                  <textarea name="cookie" rows="6" placeholder="粘贴抖音 Cookie"></textarea>
+                  <small class="field-help">用于访问登录后才能抓取的内容，例如私密页、喜欢页等。</small>
+                </label>
+                <label class="field-label field-label-wide">
+                  <span>TikTok Cookie</span>
+                  <textarea name="cookie_tiktok" rows="6" placeholder="粘贴 TikTok Cookie"></textarea>
+                  <small class="field-help">用于 TikTok 侧鉴权，很多情况下不填会拿不到完整数据。</small>
+                </label>
+              </div>
+            </section>
+
+            <section class="engine-config-group">
+              <h3>浏览器信息</h3>
+              <div class="engine-textarea-grid">
+                <label class="field-label field-label-wide">
+                  <span>browser_info JSON</span>
+                  <textarea name="browser_info" rows="10" placeholder="抖音浏览器信息 JSON"></textarea>
+                  <small class="field-help">抖音接口需要的浏览器指纹参数，通常从原项目导出后直接粘贴。</small>
+                </label>
+                <label class="field-label field-label-wide">
+                  <span>browser_info_tiktok JSON</span>
+                  <textarea name="browser_info_tiktok" rows="10" placeholder="TikTok 浏览器信息 JSON"></textarea>
+                  <small class="field-help">TikTok 接口需要的浏览器指纹参数，建议保持与登录环境一致。</small>
+                </label>
+              </div>
+            </section>
+          </form>
+        </div>
+      </section>
+
+      <section id="scan" class="view">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>扫描结果</h2>
+            <div class="actions">
+              <button id="sync-engine" type="button">同步到引擎设置</button>
+            </div>
+          </div>
+          <div class="creator-toolbar">
+            <select id="scan-creator-select"></select>
+            <button id="run-scan" type="button">扫描未下载作品</button>
+            <button id="download-scanned" type="button">下载当前可见作品</button>
+            <button id="download-selected" type="button">下载已选作品</button>
+          </div>
+          <div class="creator-toolbar creator-toolbar-compact">
+            <input id="scan-filter-keyword" placeholder="搜索标题、ID、链接" />
+            <select id="scan-filter-type">
+              <option value="">全部类型</option>
+            </select>
+            <label class="checkbox toolbar-checkbox"><input type="checkbox" id="show-downloaded" />显示已下载</label>
+            <button id="select-all-visible" type="button" class="ghost-button">全选当前可见</button>
+            <button id="clear-selection" type="button" class="ghost-button">清空选择</button>
+          </div>
+          <div id="scan-summary" class="summary summary-grid"></div>
+          <div class="list-toolbar">
+            <label>
+              每页
+              <select id="scan-page-size">
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+              </select>
+              条
+            </label>
+            <div id="scan-pagination" class="pagination"></div>
+          </div>
+          <div id="scan-results" class="creator-grid"></div>
+        </div>
+      </section>
+
+      <section id="tasks" class="view">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>任务中心</h2>
+            <div class="actions">
+              <button id="refresh-tasks" type="button">刷新</button>
+            </div>
+          </div>
+          <div class="creator-toolbar creator-toolbar-compact">
+            <input id="task-filter-keyword" placeholder="搜索账号、命令、日志" />
+            <select id="task-filter-status">
+              <option value="">全部状态</option>
+              <option value="running">运行中</option>
+              <option value="success">成功</option>
+              <option value="failed">失败</option>
+              <option value="stopped">已停止</option>
+            </select>
+            <select id="task-filter-mode">
+              <option value="">全部模式</option>
+              <option value="creator_batch_download">整号下载</option>
+              <option value="detail_download">作品下载</option>
+              <option value="auto_detail_download">自动扫描下载</option>
+            </select>
+            <select id="task-filter-kind">
+              <option value="">全部任务</option>
+              <option value="auto">自动任务</option>
+              <option value="manual">手动任务</option>
+            </select>
+          </div>
+          <div class="list-toolbar">
+            <label>
+              每页
+              <select id="tasks-page-size">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+              </select>
+              条
+            </label>
+            <div id="tasks-pagination" class="pagination"></div>
+          </div>
+          <div id="tasks-table" class="creator-grid"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+  <div id="creator-modal" class="modal-shell" hidden>
+    <div class="modal-backdrop" data-close-modal="creator"></div>
+    <div class="modal-panel modal-panel-wide">
+      <div class="modal-header">
+        <div>
+          <h3 id="creator-modal-title">新增账号</h3>
+          <p>维护主页链接、下载配置与启用状态。</p>
+        </div>
+        <button type="button" class="ghost-button icon-button" data-close-modal="creator">关闭</button>
+      </div>
+      <form id="creator-form" class="form-grid modal-form creator-form-grid">
+        <label class="field-label creator-form-span-1">
+          <span>平台</span>
+          <select name="platform">
+            <option value="douyin">抖音</option>
+            <option value="tiktok">TikTok</option>
+          </select>
+        </label>
+        <label class="field-label creator-form-span-1">
+          <span>显示名称</span>
+          <input name="name" placeholder="例如：荒瑶" required />
+          <small class="field-help">面板展示名。</small>
+        </label>
+        <label class="field-label creator-form-span-1">
+          <span>别名 / 备注</span>
+          <input name="mark" placeholder="可选，用于区分账号" />
+          <small class="field-help">账号文件夹命名。</small>
+        </label>
+        <label class="field-label creator-form-span-1">
+          <span>主页链接</span>
+          <input name="url" placeholder="账号主页 URL" required />
+        </label>
+        <label class="field-label creator-form-span-1">
+          <span>sec_user_id</span>
+          <input name="sec_user_id" placeholder="可留空，交给系统自动解析" />
+        </label>
+        <label class="field-label creator-form-span-1">
+          <span>抓取分栏</span>
+          <select name="tab">
+            <option value="post">发布作品（默认，最常用）</option>
+            <option value="favorite">喜欢作品（需公开或有对应 Cookie）</option>
+            <option value="collection">收藏作品（主要用于抖音）</option>
+          </select>
+          <small class="field-help">决定扫描账号主页里的哪个分栏。</small>
+        </label>
+        <div class="creator-form-span-3 creator-bottom-grid">
+          <label class="field-label">
+            <span>下载配置</span>
+            <select name="profile_id" id="creator-profile-select"></select>
+          </label>
+          <div class="field-label creator-toggle-field">
+            <span>自动下载</span>
+            <label class="checkbox field-checkbox"><input type="checkbox" name="auto_download_enabled" />开启定时自动下载</label>
+          </div>
+          <label class="field-label">
+            <span>执行周期</span>
+            <div class="compound-field">
+              <input name="auto_download_interval_value" type="number" min="0" step="1" placeholder="如 6" />
+              <select name="auto_download_interval_unit">
+                <option value="m">分钟</option>
+                <option value="h">小时</option>
+                <option value="d">天</option>
+              </select>
+            </div>
+            <small class="field-help">保存后自动安排首次执行。</small>
+          </label>
+          <div class="field-label creator-toggle-field">
+            <span>启用状态</span>
+            <label class="checkbox field-checkbox"><input type="checkbox" name="enabled" checked />启用这个账号</label>
+          </div>
+        </div>
+        <div class="actions creator-form-actions creator-form-span-3">
+          <button type="submit" id="creator-submit">新增账号</button>
+          <button type="button" id="creator-test-auto" class="ghost-button">立即入队执行</button>
+          <button type="button" id="creator-cancel" class="ghost-button">取消编辑</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="creator-detail-modal" class="modal-shell" hidden>
+    <div class="modal-backdrop" data-close-modal="creator-detail"></div>
+    <div class="modal-panel">
+      <div class="modal-header">
+        <div>
+          <h3>账号详情</h3>
+          <p>查看当前账号的完整配置信息。</p>
+        </div>
+        <button type="button" class="ghost-button icon-button" data-close-modal="creator-detail">关闭</button>
+      </div>
+      <div id="creator-detail-content" class="detail-grid"></div>
+    </div>
+  </div>
+
+  <div id="profile-modal" class="modal-shell" hidden>
+    <div class="modal-backdrop" data-close-modal="profile"></div>
+    <div class="modal-panel modal-panel-wide">
+      <div class="modal-header">
+        <div>
+          <h3 id="profile-modal-title">新增配置</h3>
+          <p>维护下载目录、命名格式与下载选项。</p>
+        </div>
+        <button type="button" class="ghost-button icon-button" data-close-modal="profile">关闭</button>
+      </div>
+      <form id="profile-form" class="form-grid modal-form profile-form-grid">
+        <label class="field-label">
+          <span>配置名称</span>
+          <input name="name" placeholder="例如：默认配置 / 机械盘归档" required />
+        </label>
+        <label class="field-label">
+          <span>下载根目录</span>
+          <input name="root_path" placeholder="为空时跟随引擎默认目录" />
+          <small class="field-help">Windows 本地调试建议填 <code>F:\下载\抖音</code>；如需兼容 Docker，可填 <code>/Volume/抖音</code>，系统会自动映射到当前引擎卷目录。</small>
+        </label>
+        <label class="field-label">
+          <span>文件夹名</span>
+          <input name="folder_name" placeholder="Download" value="Download" />
+        </label>
+        <div class="field-label field-label-wide profile-name-format-field">
+          <span>命名格式</span>
+          <input type="hidden" name="name_format" value="create_time type nickname desc" />
+          <div class="name-format-builder">
+            <div id="profile-name-format-list" class="name-format-list"></div>
+            <div class="name-format-controls">
+              <button type="button" id="profile-name-format-plus" class="name-format-plus-button" aria-expanded="false">+</button>
+              <div id="profile-name-format-picker" class="name-format-picker" hidden></div>
+            </div>
+          </div>
+          <small class="field-help">支持模块：发布时间、作品类型、账号昵称、作品描述、作品 ID、账号备注、账号 ID。</small>
+        </div>
+        <div class="profile-options-grid field-label-wide">
+          <label class="checkbox field-checkbox"><input type="checkbox" name="folder_mode" />按作品建文件夹</label>
+          <label class="checkbox field-checkbox"><input type="checkbox" name="music" />下载音乐</label>
+          <label class="checkbox field-checkbox"><input type="checkbox" name="dynamic_cover" />动态封面</label>
+          <label class="checkbox field-checkbox"><input type="checkbox" name="static_cover" />静态封面</label>
+          <label class="checkbox field-checkbox"><input type="checkbox" name="enabled" checked />启用这个配置</label>
+        </div>
+        <div class="actions profile-form-actions field-label-wide">
+          <button type="submit" id="profile-submit">新增配置</button>
+          <button type="button" id="profile-cancel" class="ghost-button">取消编辑</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="profile-detail-modal" class="modal-shell" hidden>
+    <div class="modal-backdrop" data-close-modal="profile-detail"></div>
+    <div class="modal-panel">
+      <div class="modal-header">
+        <div>
+          <h3>配置详情</h3>
+          <p>查看当前下载配置的完整参数。</p>
+        </div>
+        <button type="button" class="ghost-button icon-button" data-close-modal="profile-detail">关闭</button>
+      </div>
+      <div id="profile-detail-content" class="detail-grid"></div>
+    </div>
+  </div>
+
+  <div id="scan-detail-modal" class="modal-shell" hidden>
+    <div class="modal-backdrop" data-close-modal="scan-detail"></div>
+    <div class="modal-panel modal-panel-wide">
+      <div class="modal-header">
+        <div>
+          <h3>作品详情</h3>
+          <p>查看当前扫描作品的完整信息。</p>
+        </div>
+        <button type="button" class="ghost-button icon-button" data-close-modal="scan-detail">关闭</button>
+      </div>
+      <div id="scan-detail-content" class="detail-grid"></div>
+    </div>
+  </div>
+
+  <script src="/webui-static/app.panel.js" type="module"></script>
+</body>
+</html>

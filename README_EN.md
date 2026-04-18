@@ -91,6 +91,8 @@
 
 ## Web UI interaction mode
 
+> **This repository currently includes a working Web UI mode. After startup, visit `http://127.0.0.1:5555/` to open the panel, or `http://127.0.0.1:5555/api/docs` to view the engine API docs.**
+
 > **The project code has been refactored; the code for this mode has not yet been updated. It will be reopened after
 future development is completed!**
 
@@ -179,6 +181,24 @@ demo()
 
 ### Docker Container
 
+<p><b>Recommended Web UI deployment:</b></p>
+
+```bash
+docker run -d \
+  --name tkdown-webui \
+  -p 5555:5555 \
+  -v /your/path/Volume:/app/Volume \
+  -v /your/path/webui-data:/app/data \
+  <image-name>
+```
+
+<ul>
+<li><code>/app/Volume</code> stores the engine configuration, downloads, and legacy project data.</li>
+<li><code>/app/data</code> stores Web UI panel data, task logs, and runtime state.</li>
+<li>After the container starts, open <code>http://127.0.0.1:5555/</code> to use the Web UI.</li>
+<li>If you only want terminal or API mode, override the container startup command yourself.</li>
+</ul>
+
 <ol>
 <li>Get the image</li>
 <ul>
@@ -195,7 +215,7 @@ demo()
 </ul>
 </li>
 </ol>
-<p>Docker containers cannot directly access the host machine's file system, and some features may be unavailable, for example: <code>Get Cookie from Browser</code>; if there are any other issues, please report!</p>
+<p>Docker containers cannot directly access the host machine's file system, and some features may be unavailable, for example: <code>Get Cookie from Browser</code>. Desktop GUI-dependent features are also limited in containers. If you are building from a fork, rebuild the image after syncing your Docker-related changes.</p>
 <hr>
 
 ## About Cookie
