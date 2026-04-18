@@ -306,6 +306,21 @@
                   <small class="field-help">触发暂停后，等待多久再自动恢复。</small>
                 </label>
                 <label class="field-label engine-field">
+                  <span>自动批次并发数</span>
+                  <input name="auto_download_task_max_concurrency" type="number" min="1" placeholder="1" />
+                  <small class="field-help">同一时刻最多并行运行多少个自动下载批次。值越大速度越快，但也更容易压到下载引擎或网络。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>详情提取并发数</span>
+                  <input name="detail_fetch_concurrency" type="number" min="1" placeholder="2" />
+                  <small class="field-help">单个下载任务在开始下载前，并行提取作品详情的数量。默认建议 2，通常不用开得太高。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>文件下载并发数</span>
+                  <input name="file_download_max_workers" type="number" min="1" placeholder="4" />
+                  <small class="field-help">单个账号任务内部，同时下载多少个文件。视频、图集图片、音乐、封面共用这组并发。</small>
+                </label>
+                <label class="field-label engine-field">
                   <span>自动下载批次大小</span>
                   <input name="auto_download_work_batch_size" type="number" min="1" placeholder="20" />
                   <small class="field-help">每个账号一轮扫描后，单个自动下载任务最多包含多少个作品。</small>

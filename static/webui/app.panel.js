@@ -1598,6 +1598,9 @@ function fillEngineConfigForm(item) {
   const quickAddIntervalParts = splitIntervalMinutes(state.panelConfig?.quick_add_auto_download_interval_minutes || 0);
   form.quick_add_auto_download_interval_value.value = String(quickAddIntervalParts.value);
   form.quick_add_auto_download_interval_unit.value = quickAddIntervalParts.unit;
+  form.auto_download_task_max_concurrency.value = state.panelConfig?.auto_download_task_max_concurrency ?? 1;
+  form.detail_fetch_concurrency.value = state.panelConfig?.detail_fetch_concurrency ?? 2;
+  form.file_download_max_workers.value = state.panelConfig?.file_download_max_workers ?? 4;
   form.auto_download_pause_mode.value = state.panelConfig?.auto_download_pause_mode ?? "works";
   form.auto_download_pause_after_works.value = state.panelConfig?.auto_download_pause_after_works ?? 1000;
   form.auto_download_pause_after_creators.value = state.panelConfig?.auto_download_pause_after_creators ?? 10;
@@ -1626,6 +1629,12 @@ function updateAutoDownloadPauseModeFields() {
   }
   if (form.auto_download_pause_minutes) {
     form.auto_download_pause_minutes.disabled = !schedulerEnabled;
+  }
+  if (form.auto_download_task_max_concurrency) {
+    form.auto_download_task_max_concurrency.disabled = !schedulerEnabled;
+  }
+  if (form.file_download_max_workers) {
+    form.file_download_max_workers.disabled = !schedulerEnabled;
   }
   if (form.auto_download_work_batch_size) {
     form.auto_download_work_batch_size.disabled = !schedulerEnabled;
@@ -2652,6 +2661,9 @@ function bindActions() {
       quick_add_auto_download_interval_minutes: boolValue(form, "quick_add_auto_download_enabled")
         ? joinIntervalMinutes(form.quick_add_auto_download_interval_value.value, form.quick_add_auto_download_interval_unit.value)
         : 0,
+      auto_download_task_max_concurrency: Number(form.auto_download_task_max_concurrency.value || 1),
+      detail_fetch_concurrency: Number(form.detail_fetch_concurrency.value || 2),
+      file_download_max_workers: Number(form.file_download_max_workers.value || 4),
       auto_download_pause_mode: form.auto_download_pause_mode.value || "works",
       auto_download_pause_after_works: Number(form.auto_download_pause_after_works.value || 0),
       auto_download_pause_after_creators: Number(form.auto_download_pause_after_creators.value || 0),
@@ -2677,7 +2689,7 @@ function bindActions() {
     window.sessionStorage.setItem(ACCESS_STORAGE_KEY, state.panelConfig.access_password);
     fillEngineConfigForm(state.engineConfig);
     await loadRiskGuardStatus();
-    notify("引擎配置、页面访问密码、自动下载暂停策略、批次大小和风控兜底已保存。", "success");
+    notify("引擎配置、页面访问密码、自动任务并发、详情提取并发、文件下载并发、自动下载暂停策略、批次大小和风控兜底已保存。", "success");
   }));
 
   document.getElementById("run-scan").addEventListener("click", () => runLockedAction("scan:run", async () => {

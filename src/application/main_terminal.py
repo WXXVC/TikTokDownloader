@@ -1,3 +1,5 @@
+import os
+from asyncio import Semaphore, gather
 from datetime import date, datetime
 from pathlib import Path
 from platform import system
@@ -1067,15 +1069,19 @@ class TikTok:
         cookie: str = None,
         proxy: str = None,
     ):
-        detail_data = [
-            await self.handle_detail_single(
-                processor,
-                cookie,
-                proxy,
-                i,
-            )
-            for i in ids
-        ]
+        concurrency = max(1, int(os.getenv("DOUK_DETAIL_FETCH_CONCURRENCY", "1") or 1))
+        semaphore = Semaphore(concurrency)
+
+        async def fetch_one(detail_id: str):
+            async with semaphore:
+                return await self.handle_detail_single(
+                    processor,
+                    cookie,
+                    proxy,
+                    detail_id,
+                )
+
+        detail_data = await gather(*(fetch_one(i) for i in ids))
         if not any(detail_data):
             return None
         if source:

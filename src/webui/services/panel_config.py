@@ -15,6 +15,9 @@ PANEL_CONFIG_DEFAULTS = {
     "quick_add_tab": "post",
     "quick_add_auto_download_enabled": False,
     "quick_add_auto_download_interval_minutes": 0,
+    "auto_download_task_max_concurrency": 1,
+    "detail_fetch_concurrency": 2,
+    "file_download_max_workers": 4,
     "auto_download_pause_mode": "works",
     "auto_download_pause_after_works": 1000,
     "auto_download_pause_after_creators": 10,
@@ -62,3 +65,15 @@ def save_panel_config(payload: dict) -> dict:
 
 def is_auto_download_scheduler_enabled() -> bool:
     return bool(read_panel_config().get("auto_download_scheduler_enabled"))
+
+
+def get_auto_download_task_max_concurrency() -> int:
+    return max(1, int(read_panel_config().get("auto_download_task_max_concurrency") or 1))
+
+
+def get_detail_fetch_concurrency() -> int:
+    return max(1, int(read_panel_config().get("detail_fetch_concurrency") or 2))
+
+
+def get_file_download_max_workers() -> int:
+    return max(1, int(read_panel_config().get("file_download_max_workers") or 4))

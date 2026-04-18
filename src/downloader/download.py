@@ -1,3 +1,4 @@
+import os
 from asyncio import Semaphore, gather
 from datetime import datetime
 from pathlib import Path
@@ -42,7 +43,6 @@ __all__ = ["Downloader"]
 
 
 class Downloader:
-    semaphore = Semaphore(MAX_WORKERS)
     CONTENT_TYPE_MAP = {
         "image/png": "png",
         "image/jpeg": "jpeg",
@@ -89,6 +89,11 @@ class Downloader:
         self.ffmpeg = params.ffmpeg
         self.cache = params.cache
         self.truncate = params.truncate
+        self.max_workers = max(
+            1,
+            int(os.getenv("DOUK_FILE_DOWNLOAD_MAX_WORKERS", str(MAX_WORKERS)) or MAX_WORKERS),
+        )
+        self.semaphore = Semaphore(self.max_workers)
         self.general_progress_object: Callable = self.init_general_progress(
             server_mode,
         )

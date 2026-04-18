@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import os
 import subprocess
 import sys
 import threading
@@ -12,7 +13,6 @@ from datetime import datetime, timedelta
 from fastapi import HTTPException
 
 from ..config import (
-    AUTO_DOWNLOAD_TASK_MAX_CONCURRENCY,
     ENGINE_PROJECT_ROOT,
     ENGINE_DB_PATH,
     ENGINE_VOLUME_PATH,
@@ -39,6 +39,11 @@ from .engine import (
     read_engine_settings,
 )
 from .panel_config import is_auto_download_scheduler_enabled
+from .panel_config import (
+    get_auto_download_task_max_concurrency,
+    get_detail_fetch_concurrency,
+    get_file_download_max_workers,
+)
 from .profiles import get_profile
 from .risk_guard import (
     assess_low_quality_items,
@@ -596,7 +601,13 @@ def _prepare_task_volume(task_id: int, settings: dict) -> Path:
     return volume_path
 
 
-def _start_process_with_logs(task_id: int, command: list[str], cwd: str) -> tuple[subprocess.Popen, str, str, object, object]:
+def _start_process_with_logs(
+    task_id: int,
+    command: list[str],
+    cwd: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> tuple[subprocess.Popen, str, str, object, object]:
     stdout_path = TASK_LOG_DIR / f"task_{task_id}_stdout.log"
     stderr_path = TASK_LOG_DIR / f"task_{task_id}_stderr.log"
     stdout_handle = stdout_path.open("w", encoding="utf-8")
@@ -606,6 +617,7 @@ def _start_process_with_logs(task_id: int, command: list[str], cwd: str) -> tupl
         cwd=cwd,
         stdout=stdout_handle,
         stderr=stderr_handle,
+        env=env,
     )
     return process, str(stdout_path), str(stderr_path), stdout_handle, stderr_handle
 
@@ -632,10 +644,13 @@ def _launch_creator_batch_task(task_id: int, creator: dict, profile: dict, work_
     volume_path = _prepare_task_volume(task_id, settings)
     if not WORKER_ISOLATED_MAIN_PATH.exists():
         raise HTTPException(status_code=500, detail="Isolated main worker script not found")
+    process_env = os.environ.copy()
+    process_env["DOUK_FILE_DOWNLOAD_MAX_WORKERS"] = str(get_file_download_max_workers())
     process, stdout_log, stderr_log, stdout_handle, stderr_handle = _start_process_with_logs(
         task_id,
         [sys.executable, str(WORKER_ISOLATED_MAIN_PATH), "--volume", str(volume_path)],
         str(ENGINE_PROJECT_ROOT),
+        env=process_env,
     )
     task = {
         "id": task_id,
@@ -685,10 +700,14 @@ def _launch_detail_task(task_id: int, creator: dict, profile: dict, work_ids: li
         "--ids",
         *work_ids,
     ]
+    process_env = os.environ.copy()
+    process_env["DOUK_DETAIL_FETCH_CONCURRENCY"] = str(get_detail_fetch_concurrency())
+    process_env["DOUK_FILE_DOWNLOAD_MAX_WORKERS"] = str(get_file_download_max_workers())
     process, stdout_log, stderr_log, stdout_handle, stderr_handle = _start_process_with_logs(
         task_id,
         command,
         str(ENGINE_PROJECT_ROOT),
+        env=process_env,
     )
     task = {
         "id": task_id,
@@ -800,7 +819,7 @@ def create_auto_works_download_task(
         raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
     created_at = now_iso()
     task_id = next_sqlite_task_id()
-    if count_running_auto_tasks() >= AUTO_DOWNLOAD_TASK_MAX_CONCURRENCY:
+    if count_running_auto_tasks() >= get_auto_download_task_max_concurrency():
         task = _build_queued_auto_task(task_id, creator, profile, payload.work_ids, created_at)
         task["auto_session_id"] = session_id
         return save_sqlite_task(task)
@@ -816,7 +835,7 @@ def dispatch_queued_auto_tasks() -> int:
     started = 0
     if is_auto_download_paused() or is_risk_guard_active():
         return started
-    available_slots = max(0, AUTO_DOWNLOAD_TASK_MAX_CONCURRENCY - count_running_auto_tasks())
+    available_slots = max(0, get_auto_download_task_max_concurrency() - count_running_auto_tasks())
     if available_slots <= 0:
         return started
     queued_tasks = [

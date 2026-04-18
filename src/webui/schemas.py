@@ -132,6 +132,9 @@ class PanelConfig(BaseModel):
     quick_add_tab: str = "post"
     quick_add_auto_download_enabled: bool = False
     quick_add_auto_download_interval_minutes: int = 0
+    auto_download_task_max_concurrency: int = 1
+    detail_fetch_concurrency: int = 2
+    file_download_max_workers: int = 4
     auto_download_pause_mode: str = "works"
     auto_download_pause_after_works: int = 1000
     auto_download_pause_after_creators: int = 10
