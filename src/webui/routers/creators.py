@@ -3,10 +3,17 @@ from datetime import datetime
 
 from fastapi import APIRouter, Query, Response, status
 
-from ..schemas import CreatorCreate, CreatorPage, CreatorQuickAddBatchResponse, CreatorQuickAddRequest, CreatorRead, CreatorUpdate
+from ..schemas import (
+    CreatorCreate,
+    CreatorPage,
+    CreatorQuickAddBatchResponse,
+    CreatorQuickAddRequest,
+    CreatorRead,
+    CreatorUpdate,
+)
 from ..services import creators as service
-from ..services.auto_download_runtime import request_manual_creator_run
 from ..services import tasks as task_service
+from ..services.auto_download_runtime import request_manual_creator_run
 
 
 router = APIRouter(prefix="/creators", tags=["creators"])
@@ -15,7 +22,7 @@ router = APIRouter(prefix="/creators", tags=["creators"])
 @router.get("", response_model=CreatorPage)
 def list_creators(
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=10, ge=1, le=200),
+    page_size: int = Query(default=100, ge=1, le=500),
     keyword: str = Query(default=""),
     platform: str = Query(default=""),
     profile_id: int | None = Query(default=None),
@@ -66,7 +73,7 @@ async def auto_run_creator(creator_id: int):
     service.update_auto_download_result(
         creator_id,
         status="queued",
-        message="已收到手动执行请求，正在后台准备扫描并生成下载任务。",
+        message="已收到手动执行请求，正在加入后台顺序队列。",
         next_run_at=datetime.now().isoformat(timespec="seconds"),
         mark_run=False,
         record_history=False,
@@ -86,6 +93,11 @@ def clear_creator_task_records(creator_id: int, purge_download_history: bool = Q
         creator_id,
         purge_download_history=purge_download_history,
     )
+
+
+@router.post("/{creator_id}/stop-workflow")
+def stop_creator_workflow(creator_id: int):
+    return task_service.stop_creator_workflow(creator_id)
 
 
 @router.post("/{creator_id}/delete-with-history")

@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime
 
 from fastapi import HTTPException
 
@@ -47,24 +48,120 @@ def load_mock_scan_results() -> list[dict]:
     return sample
 
 
-def map_engine_items(items: list[dict]) -> list[dict]:
-    mapped = []
-    for item in items:
-        cover = item.get("static_cover", "")
-        if not cover and item.get("type") == "图集":
-            downloads = item.get("downloads") or [""]
-            cover = downloads[0] if downloads else ""
-        mapped.append(
-            {
-                "id": str(item.get("id", "")),
-                "title": item.get("desc") or item.get("id") or "未命名作品",
-                "type": item.get("type", "unknown"),
-                "published_at": item.get("create_time", ""),
-                "cover": cover,
-                "share_url": item.get("share_url", ""),
-                "raw": item,
-            }
+def _format_timestamp(value) -> str:
+    try:
+        timestamp = int(value or 0)
+    except (TypeError, ValueError):
+        return ""
+    if timestamp <= 0:
+        return ""
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _first_non_empty(value, fallback: str = "") -> str:
+    if isinstance(value, list):
+        for item in value:
+            if item:
+                return str(item)
+        return fallback
+    return str(value or fallback or "")
+
+
+def _is_raw_douyin_account_item(item: dict) -> bool:
+    return bool(item.get("aweme_id") and "create_time" in item and isinstance(item.get("author"), dict))
+
+
+def _is_raw_tiktok_account_item(item: dict) -> bool:
+    author = item.get("author") or {}
+    return bool(item.get("id") and "createTime" in item and isinstance(author, dict) and author.get("secUid"))
+
+
+def _map_processed_engine_item(item: dict) -> dict:
+    cover = item.get("static_cover", "")
+    if not cover and item.get("type") in {"图集", "collection", "鍥鹃泦"}:
+        downloads = item.get("downloads") or [""]
+        cover = downloads[0] if downloads else ""
+    return {
+        "id": str(item.get("id", "")),
+        "title": item.get("desc") or item.get("id") or "未命名作品",
+        "type": item.get("type", "unknown"),
+        "published_at": item.get("create_time", ""),
+        "cover": cover,
+        "share_url": item.get("share_url", ""),
+        "raw": item,
+    }
+
+
+def _map_raw_douyin_account_item(item: dict) -> dict:
+    images = item.get("images") or []
+    item_type = "video"
+    if images:
+        item_type = "live" if any(isinstance(image, dict) and image.get("video") for image in images) else "collection"
+
+    cover = ""
+    if item_type == "video":
+        cover = _first_non_empty((((item.get("video") or {}).get("cover")) or {}).get("url_list") or [])
+    elif images:
+        first_image = images[0] if isinstance(images[0], dict) else {}
+        cover = _first_non_empty(first_image.get("url_list") or [])
+        if not cover and first_image.get("video"):
+            cover = _first_non_empty(((((first_image.get("video") or {}).get("cover")) or {}).get("url_list")) or [])
+
+    work_id = str(item.get("aweme_id") or "")
+    share_url = f"https://www.douyin.com/video/{work_id}" if item_type == "video" else f"https://www.douyin.com/note/{work_id}"
+    return {
+        "id": work_id,
+        "title": item.get("desc") or work_id or "未命名作品",
+        "type": item_type,
+        "published_at": _format_timestamp(item.get("create_time")),
+        "cover": cover,
+        "share_url": share_url,
+        "raw": item,
+    }
+
+
+def _map_raw_tiktok_account_item(item: dict) -> dict:
+    image_post = item.get("imagePost") or {}
+    images = image_post.get("images") or []
+    item_type = "collection" if images else "video"
+    video = item.get("video") or {}
+    author = item.get("author") or {}
+
+    cover = _first_non_empty(video.get("cover"))
+    if item_type == "collection" and images:
+        first_image = images[0] if isinstance(images[0], dict) else {}
+        cover = _first_non_empty((first_image.get("imageURL") or {}).get("urlList") or [])
+
+    work_id = str(item.get("id") or "")
+    unique_id = str(author.get("uniqueId") or "")
+    share_url = ""
+    if unique_id and work_id:
+        share_url = (
+            f"https://www.tiktok.com/@{unique_id}/photo/{work_id}"
+            if item_type == "collection"
+            else f"https://www.tiktok.com/@{unique_id}/video/{work_id}"
         )
+
+    return {
+        "id": work_id,
+        "title": item.get("desc") or work_id or "未命名作品",
+        "type": item_type,
+        "published_at": _format_timestamp(item.get("createTime")),
+        "cover": cover,
+        "share_url": share_url,
+        "raw": item,
+    }
+
+
+def map_engine_items(items: list[dict]) -> list[dict]:
+    mapped: list[dict] = []
+    for item in items:
+        if _is_raw_tiktok_account_item(item):
+            mapped.append(_map_raw_tiktok_account_item(item))
+        elif _is_raw_douyin_account_item(item):
+            mapped.append(_map_raw_douyin_account_item(item))
+        else:
+            mapped.append(_map_processed_engine_item(item))
     return [item for item in mapped if item["id"]]
 
 
@@ -83,8 +180,9 @@ def _creator_folder_suffix(tab: str) -> str:
 def _extract_creator_identity_from_scan_payload(payload: list[dict]) -> tuple[str, str]:
     for item in payload:
         raw = item.get("raw") or {}
-        uid = _clean_folder_part(raw.get("uid") or "")
-        nickname = _clean_folder_part(raw.get("nickname") or "")
+        author = raw.get("author") or {}
+        uid = _clean_folder_part(raw.get("uid") or author.get("uid") or author.get("id") or "")
+        nickname = _clean_folder_part(raw.get("nickname") or author.get("nickname") or "")
         if uid or nickname:
             return uid, nickname
     return "", ""
@@ -187,13 +285,16 @@ def _filter_scan_items(
     keyword_text = str(keyword or "").strip().lower()
     if keyword_text:
         visible_items = [
-            item for item in visible_items
-            if keyword_text in " ".join([
-                item.title,
-                item.id,
-                item.share_url,
-                item.published_at,
-            ]).lower()
+            item
+            for item in visible_items
+            if keyword_text in " ".join(
+                [
+                    item.title,
+                    item.id,
+                    item.share_url,
+                    item.published_at,
+                ]
+            ).lower()
         ]
 
     if item_type:

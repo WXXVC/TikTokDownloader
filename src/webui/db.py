@@ -73,6 +73,7 @@ CREATOR_DEFAULTS = {
     "auto_download_last_status": "",
     "auto_download_last_message": "",
     "auto_download_history": [],
+    "initial_scan_completed": False,
 }
 
 
@@ -110,10 +111,18 @@ def ensure_database() -> None:
                 if key not in task:
                     task[key] = value
                     changed = True
+        scan_cache_creator_ids = {
+            int(item.get("creator_id") or 0)
+            for item in store.get("scan_cache", [])
+            if int(item.get("creator_id") or 0) > 0
+        }
         for creator in store.get("creators", []):
             for key, value in CREATOR_DEFAULTS.items():
                 if key not in creator:
-                    creator[key] = deepcopy(value)
+                    if key == "initial_scan_completed":
+                        creator[key] = int(creator.get("id") or 0) in scan_cache_creator_ids
+                    else:
+                        creator[key] = deepcopy(value)
                     changed = True
         normalized_profiles = _unique_items_by_id(store.get("profiles", []))
         if normalized_profiles != store.get("profiles", []):
@@ -657,7 +666,7 @@ def get_sqlite_dashboard_summary() -> dict:
             SELECT COUNT(1) AS running_auto_tasks
             FROM download_tasks
             WHERE status = 'running'
-              AND COALESCE(json_extract(data, '$.mode'), '') = 'auto_detail_download'
+              AND COALESCE(json_extract(data, '$.mode'), '') IN ('auto_detail_download', 'auto_creator_batch_download')
             """
         ).fetchone()
     return {
@@ -919,9 +928,9 @@ def list_sqlite_task_summaries_paginated(
         params.append(mode)
 
     if kind == "auto":
-        clauses.append("COALESCE(json_extract(data, '$.mode'), '') = 'auto_detail_download'")
+        clauses.append("COALESCE(json_extract(data, '$.mode'), '') IN ('auto_detail_download', 'auto_creator_batch_download')")
     elif kind == "manual":
-        clauses.append("COALESCE(json_extract(data, '$.mode'), '') != 'auto_detail_download'")
+        clauses.append("COALESCE(json_extract(data, '$.mode'), '') NOT IN ('auto_detail_download', 'auto_creator_batch_download')")
 
     where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     offset = (page - 1) * page_size

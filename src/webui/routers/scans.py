@@ -11,7 +11,7 @@ router = APIRouter(prefix="/scans", tags=["scans"])
 def scan_creator(
     creator_id: int,
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=6, ge=1, le=200),
+    page_size: int = Query(default=50, ge=1, le=500),
     keyword: str = Query(default=""),
     item_type: str = Query(default="", alias="type"),
     show_downloaded: bool = Query(default=False),
@@ -30,7 +30,7 @@ def scan_creator(
 def latest_scan(
     creator_id: int,
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=6, ge=1, le=200),
+    page_size: int = Query(default=50, ge=1, le=500),
     keyword: str = Query(default=""),
     item_type: str = Query(default="", alias="type"),
     show_downloaded: bool = Query(default=False),

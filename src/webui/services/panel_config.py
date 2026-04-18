@@ -15,13 +15,18 @@ PANEL_CONFIG_DEFAULTS = {
     "quick_add_tab": "post",
     "quick_add_auto_download_enabled": False,
     "quick_add_auto_download_interval_minutes": 0,
-    "auto_download_task_max_concurrency": 1,
     "detail_fetch_concurrency": 2,
     "file_download_max_workers": 4,
+    "initial_account_scan_max_pages": 0,
+    "initial_account_scan_timeout_seconds": 180,
+    "incremental_account_scan_max_pages": 0,
+    "incremental_account_scan_timeout_seconds": 180,
     "auto_download_pause_mode": "works",
     "auto_download_pause_after_works": 1000,
+    "auto_download_pause_window_minutes": 30,
     "auto_download_pause_after_creators": 10,
     "auto_download_pause_minutes": 5,
+    "auto_download_split_batches_enabled": True,
     "auto_download_work_batch_size": AUTO_DOWNLOAD_WORK_BATCH_SIZE,
     "risk_guard_enabled": False,
     "risk_guard_cooldown_hours": 24,
@@ -39,6 +44,36 @@ def read_panel_config() -> dict:
         save_panel_config({})
     data = json.loads(PANEL_CONFIG_PATH.read_text(encoding=PANEL_CONFIG_ENCODING))
     changed = False
+    legacy_scan_max_pages = data.get("account_scan_max_pages")
+    legacy_scan_timeout_seconds = data.get("account_scan_timeout_seconds")
+    if "initial_account_scan_max_pages" not in data:
+        data["initial_account_scan_max_pages"] = (
+            legacy_scan_max_pages
+            if legacy_scan_max_pages is not None
+            else PANEL_CONFIG_DEFAULTS["initial_account_scan_max_pages"]
+        )
+        changed = True
+    if "initial_account_scan_timeout_seconds" not in data:
+        data["initial_account_scan_timeout_seconds"] = (
+            legacy_scan_timeout_seconds
+            if legacy_scan_timeout_seconds is not None
+            else PANEL_CONFIG_DEFAULTS["initial_account_scan_timeout_seconds"]
+        )
+        changed = True
+    if "incremental_account_scan_max_pages" not in data:
+        data["incremental_account_scan_max_pages"] = (
+            legacy_scan_max_pages
+            if legacy_scan_max_pages is not None
+            else PANEL_CONFIG_DEFAULTS["incremental_account_scan_max_pages"]
+        )
+        changed = True
+    if "incremental_account_scan_timeout_seconds" not in data:
+        data["incremental_account_scan_timeout_seconds"] = (
+            legacy_scan_timeout_seconds
+            if legacy_scan_timeout_seconds is not None
+            else PANEL_CONFIG_DEFAULTS["incremental_account_scan_timeout_seconds"]
+        )
+        changed = True
     for key, value in PANEL_CONFIG_DEFAULTS.items():
         if key not in data:
             data[key] = deepcopy(value)
@@ -67,8 +102,8 @@ def is_auto_download_scheduler_enabled() -> bool:
     return bool(read_panel_config().get("auto_download_scheduler_enabled"))
 
 
-def get_auto_download_task_max_concurrency() -> int:
-    return max(1, int(read_panel_config().get("auto_download_task_max_concurrency") or 1))
+def is_auto_download_split_batches_enabled() -> bool:
+    return bool(read_panel_config().get("auto_download_split_batches_enabled", True))
 
 
 def get_detail_fetch_concurrency() -> int:

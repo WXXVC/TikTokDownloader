@@ -48,6 +48,12 @@ const state = {
     next_creator: null,
   },
   runningTaskCards: [],
+  manualQueue: {
+    count: 0,
+    creator_ids: [],
+    next_creator: null,
+    path: "",
+  },
   engineConfig: null,
   panelConfig: null,
   autoDownloadThrottle: null,
@@ -120,6 +126,7 @@ const state = {
     health: "",
     throttle: "",
     risk: "",
+    manualQueue: "",
     dashboard: "",
     runningTasks: "",
     profiles: "",
@@ -321,6 +328,24 @@ function buildHealthSnapshot(data) {
   });
 }
 
+function buildManualQueueSnapshot(data) {
+  if (!data) {
+    return "";
+  }
+  return stableStringify({
+    count: data.count ?? 0,
+    creator_ids: Array.isArray(data.creator_ids) ? data.creator_ids : [],
+    next_creator: data.next_creator
+      ? {
+        id: data.next_creator.id,
+        mark: data.next_creator.mark,
+        name: data.next_creator.name,
+        platform: data.next_creator.platform,
+      }
+      : null,
+  });
+}
+
 function buildThrottleSnapshot(data) {
   if (!data) {
     return "";
@@ -330,6 +355,7 @@ function buildThrottleSnapshot(data) {
     remaining_seconds: data.remaining_seconds,
     works_count: data.works_count,
     creators_count: data.creators_count,
+    works_window_minutes: data.works_window_minutes,
     last_reason: data.last_reason,
   });
 }
@@ -406,11 +432,11 @@ function buildProfilesSnapshot(items) {
 function buildCreatorsSnapshot(items) {
   const pageData = Array.isArray(items)
     ? { items, total: items.length, page: 1, page_size: items.length }
-    : (items || { items: [], total: 0, page: 1, page_size: 10 });
+    : (items || { items: [], total: 0, page: 1, page_size: 100 });
   return stableStringify({
     total: pageData.total || 0,
     page: pageData.page || 1,
-    page_size: pageData.page_size || 10,
+    page_size: pageData.page_size || 100,
     items: (pageData.items || []).map((item) => ({
       id: item.id,
       name: item.name,
@@ -430,11 +456,11 @@ function buildCreatorsSnapshot(items) {
 function buildTasksSnapshot(data) {
   const pageData = Array.isArray(data)
     ? { items: data, total: data.length, page: 1, page_size: data.length }
-    : (data || { items: [], total: 0, page: 1, page_size: 10 });
+    : (data || { items: [], total: 0, page: 1, page_size: 100 });
   return stableStringify({
     total: pageData.total || 0,
     page: pageData.page || 1,
-    page_size: pageData.page_size || 10,
+    page_size: pageData.page_size || 100,
     items: (pageData.items || []).map((item) => ({
       creator_id: item.creator_id,
       creator_name: item.creator_name,
@@ -638,6 +664,8 @@ function getAutoResultMeta(status) {
       return { label: "最近成功", pillClass: "pill-success", cardClass: "auto-status-card-active" };
     case "failed":
       return { label: "最近失败", pillClass: "pill-warn", cardClass: "auto-status-card-failed" };
+    case "stopped":
+      return { label: "已停止", pillClass: "pill-muted", cardClass: "auto-status-card-muted" };
     case "idle":
       return { label: "无新作品", pillClass: "pill-muted", cardClass: "auto-status-card-muted" };
     case "skipped":
@@ -830,13 +858,15 @@ function formatTaskModeLabel(mode) {
       return "手动作品下载";
     case "auto_detail_download":
       return "自动扫描下载";
+    case "auto_creator_batch_download":
+      return "自动整号下载";
     default:
       return mode || "(未知模式)";
   }
 }
 
 function isAutoTask(mode) {
-  return mode === "auto_detail_download";
+  return mode === "auto_detail_download" || mode === "auto_creator_batch_download";
 }
 
 function switchView(viewId) {
@@ -897,7 +927,7 @@ function renderHealth(data = state.health) {
   const failedAutoCreatorsCount = Number(dashboard.auto_failed_count || 0);
   const runningAutoTasksCount = Number(dashboard.running_auto_tasks || 0);
   const autoSchedulerEnabled = Boolean(state.panelConfig?.auto_download_scheduler_enabled);
-  const manualQueue = data.manual_queue || {};
+  const manualQueue = state.manualQueue || {};
   const manualQueueCount = Number(manualQueue.count || 0);
   const manualQueueNextCreator = manualQueue.next_creator || null;
   const throttle = state.autoDownloadThrottle;
@@ -906,8 +936,8 @@ function renderHealth(data = state.health) {
   const throttleSummary = throttle?.is_paused
     ? `暂停中，剩余 ${Math.ceil((throttle.remaining_seconds || 0) / 60)} 分钟`
     : pauseMode === "creators"
-      ? `正常，当前按账号数暂停，已累计 ${throttle?.creators_count || 0} 个账号`
-      : `正常，当前按作品数暂停，已累计 ${throttle?.works_count || 0} 个作品`;
+      ? `正常，最近 ${throttle?.works_window_minutes || state.panelConfig?.auto_download_pause_window_minutes || 30} 分钟已处理 ${throttle?.creators_count || 0} 个账号`
+      : `正常，最近 ${throttle?.works_window_minutes || state.panelConfig?.auto_download_pause_window_minutes || 30} 分钟已成功下载 ${throttle?.works_count || 0} 个作品`;
   const riskSummary = riskGuard?.is_active
     ? `冷却中，剩余 ${Math.ceil((riskGuard.remaining_seconds || 0) / 3600)} 小时`
     : `正常，HTTP ${riskGuard?.http_error_streak || 0} / 空地址 ${riskGuard?.empty_download_streak || 0} / 低清晰 ${riskGuard?.low_quality_streak || 0}`;
@@ -926,7 +956,7 @@ function renderHealth(data = state.health) {
         <header>
           <div>
             <strong>${escapeHtml(item.creator_name || `账号 ${item.creator_id}`)}</strong>
-            <small>${escapeHtml(item.platform || "")}${item.mode === "auto_detail_download" ? " 自动下载" : item.mode === "detail_download" ? " 手动作业" : item.mode === "creator_batch_download" ? " 整号下载" : ""}</small>
+            <small>${escapeHtml(item.platform || "")}${item.mode === "auto_detail_download" ? " 自动下载" : item.mode === "auto_creator_batch_download" ? " 自动整号下载" : item.mode === "detail_download" ? " 手动作业" : item.mode === "creator_batch_download" ? " 整号下载" : ""}</small>
           </div>
           <span class="pill pill-accent">执行中</span>
         </header>
@@ -951,7 +981,10 @@ function renderHealth(data = state.health) {
     <div class="stat-card"><strong>${data.engine_db_found ? "已发现" : "缺失"}</strong><small>引擎下载历史库</small></div>
     <div class="stat-card"><strong>${data.engine_settings_found ? "已发现" : "缺失"}</strong><small>引擎 settings.json</small></div>
     <div class="stat-card ${autoSchedulerEnabled ? "" : "stat-card-warn"}"><strong>${autoSchedulerEnabled ? "已开启" : "已关闭"}</strong><small>全局自动下载调度</small></div>
-    <div class="stat-card ${manualQueueCount ? "stat-card-warn" : ""}"><strong>${escapeHtml(manualQueueCount)}</strong><small>${escapeHtml(manualQueueNextCreator ? `手动排队中，下一位：${creatorDisplayName(manualQueueNextCreator)}` : "手动顺序队列")}</small></div>
+    <div class="stat-card ${manualQueueCount ? "stat-card-warn" : ""}"><strong>${escapeHtml(manualQueueCount)}</strong><small>当前手动队列数量</small></div>
+    ${manualQueueNextCreator
+      ? `<button type="button" class="stat-card stat-card-button" data-dashboard-action="manual-queue-next" data-creator-id="${manualQueueNextCreator.id}"><strong>${escapeHtml(creatorDisplayName(manualQueueNextCreator))}</strong><small>手动队列中的下一个账号</small></button>`
+      : `<div class="stat-card"><strong>(暂无)</strong><small>手动队列中的下一个账号</small></div>`}
     <button type="button" class="stat-card stat-card-button stat-card-accent" data-dashboard-action="auto-creators"><strong>${escapeHtml(autoCreatorsCount)}</strong><small>已开启自动下载的账号</small></button>
     <button type="button" class="stat-card stat-card-button" data-dashboard-action="running-auto-tasks"><strong>${escapeHtml(runningAutoTasksCount)}</strong><small>运行中的自动任务</small></button>
     <button type="button" class="stat-card stat-card-button ${failedAutoCreatorsCount ? "stat-card-warn" : ""}" data-dashboard-action="failed-creators"><strong>${escapeHtml(failedAutoCreatorsCount)}</strong><small>最近执行失败的账号</small></button>
@@ -996,6 +1029,12 @@ function renderHealth(data = state.health) {
         autoEnabled: "true",
         autoStatus: "failed",
       });
+    });
+  });
+
+  document.querySelectorAll("[data-dashboard-action='manual-queue-next']").forEach((button) => {
+    button.addEventListener("click", () => {
+      openCreatorDetailFromDashboard(button.dataset.creatorId);
     });
   });
 
@@ -1391,6 +1430,7 @@ function renderCreatorDetail(item) {
       <div class="detail-actions-row">
         <button type="button" class="ghost-button" data-reset-auto-schedule="${item.id}" ${item.auto_download_enabled ? "" : "disabled"}>重置下次执行时间</button>
         <button type="button" class="ghost-button" data-detail-auto-run="${item.id}" ${retrying ? "disabled" : ""}>${retrying ? "提交中..." : "立即入队执行"}</button>
+        <button type="button" class="ghost-button danger-ghost-button" data-stop-creator-workflow="${item.id}">结束任务</button>
         <button type="button" class="ghost-button danger-ghost-button" data-clear-task-records="${item.id}">清理下载任务记录</button>
         ${item.auto_download_last_status === "failed"
           ? `<button type="button" class="ghost-button danger-ghost-button" data-detail-auto-retry="${item.id}" ${retrying ? "disabled" : ""}>${retrying ? "重试中..." : "失败重试"}</button>`
@@ -1449,12 +1489,31 @@ function renderCreatorDetail(item) {
       if (!confirmed) {
         return;
       }
-      const purgeDownloadHistory = window.confirm("是否一起删除这个账号当前可识别作品的已下载记录？\n\n确定：同时清理已下载记录，适合彻底重置账号\n取消：只清理任务记录和自动状态");
+      const purgeDownloadHistory = window.confirm("是否一起删除这个账号当前可识别作品的已下载记录？\n\n确定：同时清理已下载记录和扫描缓存，下次会按首次全量状态重新扫描\n取消：只清理任务记录和自动状态");
       const result = await clearCreatorTaskRecords(item.id, purgeDownloadHistory);
       const message = purgeDownloadHistory
-        ? `已清理 ${result.deleted_task_count ?? 0} 条任务记录，停止 ${result.stopped_task_count ?? 0} 个未完成任务，并删除 ${result.deleted_download_records ?? 0} 条已下载记录（识别作品 ${result.resolved_work_ids ?? 0} 个）。`
+        ? `已清理 ${result.deleted_task_count ?? 0} 条任务记录，停止 ${result.stopped_task_count ?? 0} 个未完成任务，删除 ${result.deleted_download_records ?? 0} 条已下载记录（识别作品 ${result.resolved_work_ids ?? 0} 个），并清空 ${result.deleted_scan_cache_count ?? 0} 条扫描缓存。`
         : `已清理 ${result.deleted_task_count ?? 0} 条任务记录，并停止 ${result.stopped_task_count ?? 0} 个未完成任务。`;
       notify(message, "success");
+      if (state.viewingCreatorId === item.id) {
+        const detail = await request(`/creators/${item.id}`);
+        renderCreatorDetail(detail);
+      }
+    }));
+  }
+
+  const stopWorkflowButton = content.querySelector("[data-stop-creator-workflow]");
+  if (stopWorkflowButton) {
+    stopWorkflowButton.addEventListener("click", () => runLockedAction(`creator:stop-workflow:${item.id}`, async () => {
+      const confirmed = window.confirm("结束这个账号当前的扫描、排队和下载任务？\n\n如果正处于扫描请求中，会在本次请求返回后停止，并阻止继续入队。");
+      if (!confirmed) {
+        return;
+      }
+      const result = await request(`/creators/${item.id}/stop-workflow`, { method: "POST" });
+      notify(result.message || "已发送结束任务请求。", "success");
+      await loadCreators();
+      await withLoaderLock("load:tasks", loadTasks);
+      await loadPollState();
       if (state.viewingCreatorId === item.id) {
         const detail = await request(`/creators/${item.id}`);
         renderCreatorDetail(detail);
@@ -1598,13 +1657,18 @@ function fillEngineConfigForm(item) {
   const quickAddIntervalParts = splitIntervalMinutes(state.panelConfig?.quick_add_auto_download_interval_minutes || 0);
   form.quick_add_auto_download_interval_value.value = String(quickAddIntervalParts.value);
   form.quick_add_auto_download_interval_unit.value = quickAddIntervalParts.unit;
-  form.auto_download_task_max_concurrency.value = state.panelConfig?.auto_download_task_max_concurrency ?? 1;
   form.detail_fetch_concurrency.value = state.panelConfig?.detail_fetch_concurrency ?? 2;
   form.file_download_max_workers.value = state.panelConfig?.file_download_max_workers ?? 4;
+  form.initial_account_scan_max_pages.value = state.panelConfig?.initial_account_scan_max_pages ?? 0;
+  form.initial_account_scan_timeout_seconds.value = state.panelConfig?.initial_account_scan_timeout_seconds ?? 180;
+  form.incremental_account_scan_max_pages.value = state.panelConfig?.incremental_account_scan_max_pages ?? 0;
+  form.incremental_account_scan_timeout_seconds.value = state.panelConfig?.incremental_account_scan_timeout_seconds ?? 180;
   form.auto_download_pause_mode.value = state.panelConfig?.auto_download_pause_mode ?? "works";
   form.auto_download_pause_after_works.value = state.panelConfig?.auto_download_pause_after_works ?? 1000;
+  form.auto_download_pause_window_minutes.value = state.panelConfig?.auto_download_pause_window_minutes ?? 30;
   form.auto_download_pause_after_creators.value = state.panelConfig?.auto_download_pause_after_creators ?? 10;
   form.auto_download_pause_minutes.value = state.panelConfig?.auto_download_pause_minutes ?? 5;
+  form.auto_download_split_batches_enabled.checked = Boolean(state.panelConfig?.auto_download_split_batches_enabled ?? true);
   form.auto_download_work_batch_size.value = state.panelConfig?.auto_download_work_batch_size ?? 20;
   form.risk_guard_enabled.checked = Boolean(state.panelConfig?.risk_guard_enabled);
   form.risk_guard_cooldown_hours.value = state.panelConfig?.risk_guard_cooldown_hours ?? 24;
@@ -1624,23 +1688,21 @@ function updateAutoDownloadPauseModeFields() {
   }
   const schedulerEnabled = Boolean(form.auto_download_scheduler_enabled?.checked);
   const pauseMode = form.auto_download_pause_mode?.value || "works";
+  const splitBatchesEnabled = Boolean(form.auto_download_split_batches_enabled?.checked);
   if (form.auto_download_pause_mode) {
     form.auto_download_pause_mode.disabled = !schedulerEnabled;
   }
   if (form.auto_download_pause_minutes) {
     form.auto_download_pause_minutes.disabled = !schedulerEnabled;
   }
-  if (form.auto_download_task_max_concurrency) {
-    form.auto_download_task_max_concurrency.disabled = !schedulerEnabled;
-  }
-  if (form.file_download_max_workers) {
-    form.file_download_max_workers.disabled = !schedulerEnabled;
-  }
   if (form.auto_download_work_batch_size) {
-    form.auto_download_work_batch_size.disabled = !schedulerEnabled;
+    form.auto_download_work_batch_size.disabled = !splitBatchesEnabled;
   }
   if (form.auto_download_pause_after_works) {
     form.auto_download_pause_after_works.disabled = !schedulerEnabled || pauseMode !== "works";
+  }
+  if (form.auto_download_pause_window_minutes) {
+    form.auto_download_pause_window_minutes.disabled = !schedulerEnabled || pauseMode !== "works";
   }
   if (form.auto_download_pause_after_creators) {
     form.auto_download_pause_after_creators.disabled = !schedulerEnabled || pauseMode !== "creators";
@@ -1741,6 +1803,10 @@ function renderProfiles() {
 }
 
 function renderCreators() {
+  const pageSizeSelect = document.getElementById("creators-page-size");
+  if (pageSizeSelect) {
+    pageSizeSelect.value = String(state.pagination.creators.pageSize);
+  }
   const pageData = {
     items: state.creatorPage.items || [],
     totalItems: state.creatorPage.total || 0,
@@ -1882,12 +1948,20 @@ function renderCreators() {
       }
       await loadCreators();
       await loadCreatorOptions();
+      await withLoaderLock("load:tasks", loadTasks);
+      await loadPollState();
     }));
   });
 }
 
 function renderScan(data) {
   state.currentScan = data;
+  state.pagination.scan.page = data.page || state.pagination.scan.page;
+  state.pagination.scan.pageSize = data.page_size || state.pagination.scan.pageSize;
+  const pageSizeSelect = document.getElementById("scan-page-size");
+  if (pageSizeSelect) {
+    pageSizeSelect.value = String(state.pagination.scan.pageSize);
+  }
   if (state.viewingScanWorkId) {
     const currentItem = (state.currentScan?.items || []).find((item) => String(item.id) === String(state.viewingScanWorkId));
     if (currentItem) {
@@ -2014,20 +2088,21 @@ function renderScan(data) {
 }
 
 function renderTasks() {
+  const pageSizeSelect = document.getElementById("tasks-page-size");
+  if (pageSizeSelect) {
+    pageSizeSelect.value = String(state.pagination.tasks.pageSize);
+  }
   const statusSelect = document.getElementById("task-filter-status");
   const modeSelect = document.getElementById("task-filter-mode");
   const kindSelect = document.getElementById("task-filter-kind");
   if (statusSelect) {
     statusSelect.value = state.taskFilters.status;
-    statusSelect.disabled = true;
   }
   if (modeSelect) {
     modeSelect.value = state.taskFilters.mode;
-    modeSelect.disabled = true;
   }
   if (kindSelect) {
     kindSelect.value = state.taskFilters.kind;
-    kindSelect.disabled = true;
   }
   const pageData = {
     items: state.taskPage.items || [],
@@ -2246,6 +2321,15 @@ async function loadTasks() {
   if (state.taskFilters.keyword) {
     query.set("keyword", state.taskFilters.keyword);
   }
+  if (state.taskFilters.status) {
+    query.set("status", state.taskFilters.status);
+  }
+  if (state.taskFilters.mode) {
+    query.set("mode", state.taskFilters.mode);
+  }
+  if (state.taskFilters.kind) {
+    query.set("kind", state.taskFilters.kind);
+  }
   const data = await request(`/tasks/summary?${query.toString()}`);
   const snapshot = buildTasksSnapshot(data);
   if (snapshot === state.snapshots.tasks) {
@@ -2272,6 +2356,18 @@ async function loadPollState() {
   if (healthSnapshot !== state.snapshots.health) {
     state.snapshots.health = healthSnapshot;
     state.health = data.health;
+    renderHealth();
+  }
+
+  const manualQueueSnapshot = buildManualQueueSnapshot(data.manual_queue);
+  if (manualQueueSnapshot !== state.snapshots.manualQueue) {
+    state.snapshots.manualQueue = manualQueueSnapshot;
+    state.manualQueue = data.manual_queue || {
+      count: 0,
+      creator_ids: [],
+      next_creator: null,
+      path: "",
+    };
     renderHealth();
   }
 
@@ -2625,6 +2721,9 @@ function bindActions() {
   getEngineConfigForm().auto_download_scheduler_enabled.addEventListener("change", () => {
     updateAutoDownloadPauseModeFields();
   });
+  getEngineConfigForm().auto_download_split_batches_enabled.addEventListener("change", () => {
+    updateAutoDownloadPauseModeFields();
+  });
 
   document.getElementById("save-engine-config").addEventListener("click", () => runLockedAction("engine:save-config", async () => {
     const form = getEngineConfigForm();
@@ -2661,13 +2760,18 @@ function bindActions() {
       quick_add_auto_download_interval_minutes: boolValue(form, "quick_add_auto_download_enabled")
         ? joinIntervalMinutes(form.quick_add_auto_download_interval_value.value, form.quick_add_auto_download_interval_unit.value)
         : 0,
-      auto_download_task_max_concurrency: Number(form.auto_download_task_max_concurrency.value || 1),
       detail_fetch_concurrency: Number(form.detail_fetch_concurrency.value || 2),
       file_download_max_workers: Number(form.file_download_max_workers.value || 4),
+      initial_account_scan_max_pages: Number(form.initial_account_scan_max_pages.value || 0),
+      initial_account_scan_timeout_seconds: Number(form.initial_account_scan_timeout_seconds.value || 180),
+      incremental_account_scan_max_pages: Number(form.incremental_account_scan_max_pages.value || 0),
+      incremental_account_scan_timeout_seconds: Number(form.incremental_account_scan_timeout_seconds.value || 180),
       auto_download_pause_mode: form.auto_download_pause_mode.value || "works",
       auto_download_pause_after_works: Number(form.auto_download_pause_after_works.value || 0),
+      auto_download_pause_window_minutes: Number(form.auto_download_pause_window_minutes.value || 30),
       auto_download_pause_after_creators: Number(form.auto_download_pause_after_creators.value || 0),
       auto_download_pause_minutes: Number(form.auto_download_pause_minutes.value || 5),
+      auto_download_split_batches_enabled: boolValue(form, "auto_download_split_batches_enabled"),
       auto_download_work_batch_size: Number(form.auto_download_work_batch_size.value || 20),
       risk_guard_enabled: boolValue(form, "risk_guard_enabled"),
       risk_guard_cooldown_hours: Number(form.risk_guard_cooldown_hours.value || 24),
@@ -2689,7 +2793,7 @@ function bindActions() {
     window.sessionStorage.setItem(ACCESS_STORAGE_KEY, state.panelConfig.access_password);
     fillEngineConfigForm(state.engineConfig);
     await loadRiskGuardStatus();
-    notify("引擎配置、页面访问密码、自动任务并发、详情提取并发、文件下载并发、自动下载暂停策略、批次大小和风控兜底已保存。", "success");
+    notify("引擎配置、页面访问密码、详情提取并发、文件下载并发、首次全量与后续增量扫描策略、自动下载暂停策略、批次拆分设置和风控兜底已保存。", "success");
   }));
 
   document.getElementById("run-scan").addEventListener("click", () => runLockedAction("scan:run", async () => {

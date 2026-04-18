@@ -29,6 +29,30 @@ from .engine import (
 from .panel_config import read_panel_config
 
 
+def has_creator_completed_initial_scan(item: dict) -> bool:
+    state = item.get("initial_scan_completed")
+    if state is not None:
+        return bool(state)
+    if str(item.get("auto_download_last_status") or "").strip().lower() in {"success", "idle"}:
+        return True
+    for history_item in item.get("auto_download_history") or []:
+        if str(history_item.get("status") or "").strip().lower() in {"success", "idle"}:
+            return True
+    creator_id = int(item.get("id") or 0)
+    if creator_id <= 0:
+        return False
+    return bool(list_sqlite_scan_cache(creator_id))
+
+
+def set_creator_initial_scan_completed(creator_id: int, completed: bool) -> dict:
+    item = get_sqlite_creator(creator_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Creator not found")
+    item["initial_scan_completed"] = bool(completed)
+    item["updated_at"] = now_iso()
+    return save_sqlite_creator(item)
+
+
 def _normalize_schedule_fields(item: dict) -> None:
     interval = max(0, int(item.get("auto_download_interval_minutes") or 0))
     item["auto_download_interval_minutes"] = interval
@@ -253,6 +277,7 @@ def create_creator(payload: CreatorCreate):
             _ensure_creator_not_duplicate(item)
     item["id"] = None
     item["profile_id"] = item["profile_id"] or 1
+    item["initial_scan_completed"] = False
     _normalize_schedule_fields(item)
     item["created_at"] = now_iso()
     item["updated_at"] = item["created_at"]
@@ -297,6 +322,7 @@ def _create_single_creator_via_quick_add(url: str):
         "auto_download_last_status": "",
         "auto_download_last_message": "",
         "auto_download_history": [],
+        "initial_scan_completed": False,
     }
     _normalize_schedule_fields(item)
     item["created_at"] = now_iso()
@@ -376,6 +402,11 @@ def update_creator(creator_id: int, payload: CreatorUpdate):
 def delete_creator(creator_id: int):
     if not get_sqlite_creator(creator_id):
         raise HTTPException(status_code=404, detail="Creator not found")
+    from .auto_download_runtime import remove_manual_creator_run
+    from . import tasks as task_service
+
+    task_service.clear_creator_task_records(creator_id, purge_download_history=False)
+    remove_manual_creator_run(creator_id)
     delete_sqlite_creator(creator_id)
 
 
@@ -417,6 +448,8 @@ def delete_creator_with_download_history(creator_id: int) -> dict:
     item = get_sqlite_creator(creator_id)
     if not item:
         raise HTTPException(status_code=404, detail="Creator not found")
+    from .auto_download_runtime import remove_manual_creator_run
+    from . import tasks as task_service
 
     scan_cache_rows = list_sqlite_scan_cache(creator_id)
     item["_scan_cache_rows"] = scan_cache_rows
@@ -430,6 +463,8 @@ def delete_creator_with_download_history(creator_id: int) -> dict:
         work_ids = collect_remote_creator_work_ids_for_purge(item)
         work_id_source = "remote_account_scan"
 
+    task_service.clear_creator_task_records(creator_id, purge_download_history=False)
+    remove_manual_creator_run(creator_id)
     deleted_count = delete_downloaded_ids(work_ids) if work_ids else 0
     delete_sqlite_creator(creator_id)
     return {

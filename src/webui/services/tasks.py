@@ -6,6 +6,7 @@ import sys
 import threading
 import json
 import shutil
+import sqlite3
 from pathlib import Path
 from shutil import copy2
 from datetime import datetime, timedelta
@@ -22,13 +23,14 @@ from ..config import (
     TASK_RUNTIME_CLEANUP_INTERVAL_SECONDS,
     TASK_RUNTIME_RETENTION_SECONDS,
     WORKER_ISOLATED_DETAIL_PATH,
+    WORKER_ISOLATED_BATCH_PATH,
     WORKER_ISOLATED_MAIN_PATH,
 )
 from ..db import get_sqlite_task, list_sqlite_scan_cache, list_sqlite_tasks, next_sqlite_task_id, now_iso, save_sqlite_task
-from ..db import count_sqlite_tasks, delete_sqlite_tasks_by_creator, list_sqlite_task_summaries, list_sqlite_task_summaries_paginated, list_sqlite_tasks_by_statuses
+from ..db import count_sqlite_tasks, delete_sqlite_scan_cache_for_creator, delete_sqlite_tasks_by_creator, list_sqlite_task_summaries, list_sqlite_task_summaries_paginated, list_sqlite_tasks_by_statuses
 from ..schemas import DownloadTaskCreate, DownloadWorksTaskCreate
 from .auto_download_throttle import is_auto_download_paused, record_auto_download_progress
-from .creators import clear_auto_download_runtime_state, collect_creator_work_ids_for_purge, get_creator, list_creators, update_auto_download_result
+from .creators import clear_auto_download_runtime_state, collect_creator_work_ids_for_purge, get_creator, list_creators, set_creator_initial_scan_completed, update_auto_download_result
 from .engine import (
     build_run_command,
     build_settings_payload,
@@ -40,7 +42,6 @@ from .engine import (
 )
 from .panel_config import is_auto_download_scheduler_enabled
 from .panel_config import (
-    get_auto_download_task_max_concurrency,
     get_detail_fetch_concurrency,
     get_file_download_max_workers,
 )
@@ -61,6 +62,8 @@ PROCESS_REGISTRY: dict[int, dict] = {}
 TASK_LAUNCH_LOCK = threading.Lock()
 TERMINAL_TASK_STATUSES = {"success", "failed", "stopped"}
 ACTIVE_AUTO_TASK_STATUSES = {"queued", "running"}
+AUTO_TASK_PARALLELISM = 1
+AUTO_TASK_MODES = {"auto_detail_download", "auto_creator_batch_download"}
 
 
 def has_running_task_for_creator(creator_id: int) -> bool:
@@ -83,19 +86,21 @@ def refresh_active_task_statuses() -> None:
 
 
 def count_running_auto_tasks() -> int:
-    for task in list_sqlite_tasks_by_statuses(
-        mode="auto_detail_download",
-        statuses=("running",),
-    ):
+    for task in list_sqlite_tasks_by_statuses(statuses=("running",)):
+        if task.get("mode") not in AUTO_TASK_MODES:
+            continue
         _task_status(task)
-    return count_sqlite_tasks(mode="auto_detail_download", status="running")
+    return sum(
+        1
+        for task in list_sqlite_tasks_by_statuses(statuses=("running",))
+        if _task_status(task).get("status") == "running" and task.get("mode") in AUTO_TASK_MODES
+    )
 
 
 def has_active_auto_task_workload(exclude_creator_id: int | None = None) -> bool:
-    for task in list_sqlite_tasks_by_statuses(
-        mode="auto_detail_download",
-        statuses=tuple(ACTIVE_AUTO_TASK_STATUSES),
-    ):
+    for task in list_sqlite_tasks_by_statuses(statuses=tuple(ACTIVE_AUTO_TASK_STATUSES)):
+        if task.get("mode") not in AUTO_TASK_MODES:
+            continue
         current = _task_status(task)
         if current.get("status") not in ACTIVE_AUTO_TASK_STATUSES:
             continue
@@ -109,10 +114,8 @@ def has_active_auto_task_workload(exclude_creator_id: int | None = None) -> bool
 def _list_auto_session_tasks(creator_id: int, session_id: str) -> list[dict]:
     return [
         task
-        for task in list_sqlite_tasks_by_statuses(
-            mode="auto_detail_download",
-            creator_id=creator_id,
-        )
+        for task in list_sqlite_tasks_by_statuses(creator_id=creator_id)
+        if task.get("mode") in AUTO_TASK_MODES
         if str(task.get("auto_session_id") or "").strip() == session_id
     ]
 
@@ -184,6 +187,7 @@ def _task_status(task: dict) -> dict:
         task["exit_code"] = code
         _evaluate_completed_task_risk(task)
         _record_completed_auto_download_progress(task)
+        _mark_creator_initial_scan_completed_for_task(task)
         _sync_creator_auto_download_status(task)
         task["updated_at"] = now_iso()
         save_sqlite_task(task)
@@ -225,6 +229,9 @@ def list_task_center_summary_page(
     page: int = 1,
     page_size: int = 10,
     keyword: str = "",
+    status: str = "",
+    mode: str = "",
+    kind: str = "",
 ):
     refresh_active_task_statuses()
     page = max(1, int(page or 1))
@@ -268,9 +275,24 @@ def list_task_center_summary_page(
         for creator in creators
     }
 
+    status_text = str(status or "").strip().lower()
+    mode_text = str(mode or "").strip()
+    kind_text = str(kind or "").strip().lower()
+
     for task in tasks:
         creator_id = int(task.get("creator_id") or 0)
         if not creator_id:
+            continue
+        task_status = str(task.get("status") or "").strip().lower()
+        task_mode = str(task.get("mode") or "").strip()
+        is_auto_task = task_mode in AUTO_TASK_MODES
+        if status_text and task_status != status_text:
+            continue
+        if mode_text and task_mode != mode_text:
+            continue
+        if kind_text == "auto" and not is_auto_task:
+            continue
+        if kind_text == "manual" and is_auto_task:
             continue
         summary = summaries.setdefault(
             creator_id,
@@ -366,7 +388,7 @@ def list_running_task_cards() -> list[dict]:
         status = str(current.get("status") or "")
         if status not in {"queued", "running"}:
             continue
-        if current.get("mode") == "auto_detail_download":
+        if current.get("mode") in AUTO_TASK_MODES:
             session_id = str(current.get("auto_session_id") or "").strip() or f"creator:{current.get('creator_id')}"
             group_key = (int(current.get("creator_id") or 0), session_id)
             group = auto_groups.setdefault(
@@ -428,7 +450,7 @@ def list_running_task_cards() -> list[dict]:
                 "completed_count": completed_count,
                 "progress_percent": progress_percent,
                 "target_folder_name": group["target_folder_name"],
-                "message": group["message"] or "Auto detail download queued",
+                "message": group["message"] or "Auto download queued",
             }
         )
     items.sort(key=lambda item: int(item.get("task_id") or 0), reverse=True)
@@ -478,7 +500,7 @@ def _evaluate_completed_task_risk(task: dict) -> None:
 
 
 def _record_completed_auto_download_progress(task: dict) -> None:
-    if task.get("mode") != "auto_detail_download" or task.get("status") != "success":
+    if task.get("mode") not in AUTO_TASK_MODES or task.get("status") != "success":
         return
     work_ids = [str(item) for item in (task.get("work_ids") or []) if item]
     if not work_ids:
@@ -495,8 +517,24 @@ def _record_completed_auto_download_progress(task: dict) -> None:
         task["message"] = f"{task.get('message') or 'Downloader process finished successfully'} {throttle_state['last_reason']}".strip()
 
 
-def _sync_creator_auto_download_status(task: dict) -> None:
-    if task.get("mode") != "auto_detail_download":
+def _mark_creator_initial_scan_completed_for_task(task: dict) -> None:
+    if task.get("status") != "success":
+        return
+    if task.get("mode") not in {"creator_batch_download", "auto_creator_batch_download", "auto_detail_download"}:
+        return
+    creator_id = int(task.get("creator_id") or 0)
+    if creator_id <= 0:
+        return
+    try:
+        set_creator_initial_scan_completed(creator_id, True)
+    except HTTPException:
+        return
+
+
+def _sync_creator_auto_download_status_legacy(task: dict) -> None:
+    # Deprecated legacy stub kept only to avoid editing through historical mojibake content.
+    return
+    if task.get("mode") not in AUTO_TASK_MODES:
         return
     creator_id = int(task.get("creator_id") or 0)
     if not creator_id:
@@ -508,7 +546,7 @@ def _sync_creator_auto_download_status(task: dict) -> None:
 
     next_run_at = creator.get("auto_download_next_run_at")
     session_summary = _summarize_auto_session(task)
-    if session_summary:
+    if session_summary and task.get("mode") == "auto_detail_download":
         if session_summary["pending_batches"] > 0:
             update_auto_download_result(
                 creator_id,
@@ -570,6 +608,88 @@ def _sync_creator_auto_download_status(task: dict) -> None:
     )
 
 
+def _sync_creator_auto_download_status(task: dict) -> None:
+    if task.get("mode") not in AUTO_TASK_MODES:
+        return
+    creator_id = int(task.get("creator_id") or 0)
+    if not creator_id:
+        return
+    try:
+        creator = get_creator(creator_id)
+    except HTTPException:
+        return
+
+    next_run_at = creator.get("auto_download_next_run_at")
+    session_summary = _summarize_auto_session(task)
+    if session_summary and task.get("mode") == "auto_detail_download":
+        if session_summary["pending_batches"] > 0:
+            update_auto_download_result(
+                creator_id,
+                status="running",
+                message=(
+                    f"当前账号仍在顺序下载中，已完成批次 "
+                    f"{session_summary['completed_batches']}/{session_summary['total_batches']}，"
+                    f"作品 {session_summary['downloaded_works']}/{session_summary['total_works']}。"
+                ),
+                next_run_at=next_run_at,
+                mark_run=False,
+                record_history=False,
+            )
+            return
+
+        final_status = "failed" if session_summary["failed_batches"] > 0 else "success"
+        final_message = (
+            f"当前账号自动下载结束，共 {session_summary['total_batches']} 个批次，"
+            f"失败 {session_summary['failed_batches']} 个，成功下载作品 "
+            f"{session_summary['downloaded_works']}/{session_summary['total_works']}。"
+            if final_status == "failed"
+            else (
+                f"当前账号自动下载完成，共 {session_summary['total_batches']} 个批次，"
+                f"成功下载作品 {session_summary['downloaded_works']}/{session_summary['total_works']}。"
+            )
+        )
+        update_auto_download_result(
+            creator_id,
+            status=final_status,
+            message=final_message,
+            next_run_at=next_run_at,
+            mark_run=False,
+        )
+        return
+
+    work_ids = [str(item) for item in (task.get("work_ids") or []) if item]
+    if task.get("status") == "success":
+        downloaded_ids = read_downloaded_ids(force_refresh=True)
+        success_count = sum(1 for work_id in work_ids if work_id in downloaded_ids)
+        message = (
+            f"自动整号下载完成，成功下载 {success_count}/{len(work_ids)} 个作品。"
+            if task.get("mode") == "auto_creator_batch_download" and work_ids
+            else (
+                f"自动下载完成，成功下载 {success_count}/{len(work_ids)} 个作品。"
+                if work_ids
+                else "自动下载完成。"
+            )
+        )
+        update_auto_download_result(
+            creator_id,
+            status="success",
+            message=message,
+            next_run_at=next_run_at,
+            mark_run=False,
+        )
+        return
+
+    update_auto_download_result(
+        creator_id,
+        status="failed",
+        message=task.get("message") or (
+            "自动整号下载任务失败" if task.get("mode") == "auto_creator_batch_download" else "自动下载任务失败"
+        ),
+        next_run_at=next_run_at,
+        mark_run=False,
+    )
+
+
 def _ensure_shared_db_link(target_volume: Path) -> None:
     shared_db = ENGINE_DB_PATH
     target_db = target_volume / "DouK-Downloader.db"
@@ -589,10 +709,37 @@ def _ensure_shared_db_link(target_volume: Path) -> None:
     target_db.touch(exist_ok=True)
 
 
+def _prepare_runtime_engine_db(target_volume: Path) -> None:
+    target_db = target_volume / "DouK-Downloader.db"
+    if not target_db.exists():
+        return
+    try:
+        with sqlite3.connect(target_db) as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS config_data (
+                NAME TEXT PRIMARY KEY,
+                VALUE INTEGER NOT NULL CHECK(VALUE IN (0, 1))
+                );"""
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO config_data (NAME, VALUE)
+                VALUES ('Record', 1), ('Logger', 1), ('Disclaimer', 1);"""
+            )
+            conn.execute("REPLACE INTO config_data (NAME, VALUE) VALUES ('Record', 1)")
+            conn.execute("REPLACE INTO config_data (NAME, VALUE) VALUES ('Logger', 1)")
+            conn.execute("REPLACE INTO config_data (NAME, VALUE) VALUES ('Disclaimer', 1)")
+            conn.commit()
+    except sqlite3.Error:
+        # Shared engine databases can be readonly in some deployments.
+        # Keep the task runnable even if we cannot flip logger switches here.
+        return
+
+
 def _prepare_task_volume(task_id: int, settings: dict) -> Path:
     volume_path = TASK_RUNTIME_DIR / f"task_{task_id}" / "Volume"
     volume_path.mkdir(parents=True, exist_ok=True)
     _ensure_shared_db_link(volume_path)
+    _prepare_runtime_engine_db(volume_path)
     settings_path = volume_path / "settings.json"
     settings_path.write_text(
         json.dumps(settings, ensure_ascii=False, indent=2),
@@ -636,7 +783,14 @@ def _resolve_download_root(profile: dict, settings: dict) -> str:
     return str(ENGINE_VOLUME_PATH)
 
 
-def _launch_creator_batch_task(task_id: int, creator: dict, profile: dict, work_ids: list[str] | None = None) -> dict:
+def _launch_creator_batch_task(
+    task_id: int,
+    creator: dict,
+    profile: dict,
+    work_ids: list[str] | None = None,
+    *,
+    mode: str = "creator_batch_download",
+) -> dict:
     settings = read_engine_settings()
     settings.update(build_settings_payload(profile, [creator]))
     settings["root"] = _resolve_download_root(profile, settings)
@@ -645,6 +799,7 @@ def _launch_creator_batch_task(task_id: int, creator: dict, profile: dict, work_
     if not WORKER_ISOLATED_MAIN_PATH.exists():
         raise HTTPException(status_code=500, detail="Isolated main worker script not found")
     process_env = os.environ.copy()
+    process_env["PYTHONUNBUFFERED"] = "1"
     process_env["DOUK_FILE_DOWNLOAD_MAX_WORKERS"] = str(get_file_download_max_workers())
     process, stdout_log, stderr_log, stdout_handle, stderr_handle = _start_process_with_logs(
         task_id,
@@ -659,7 +814,7 @@ def _launch_creator_batch_task(task_id: int, creator: dict, profile: dict, work_
         "platform": creator["platform"],
         "profile_id": profile["id"],
         "status": "running",
-        "mode": "creator_batch_download",
+        "mode": mode,
         "item_count": len(work_ids or []),
         "run_command": settings["run_command"],
         "pid": process.pid,
@@ -701,6 +856,7 @@ def _launch_detail_task(task_id: int, creator: dict, profile: dict, work_ids: li
         *work_ids,
     ]
     process_env = os.environ.copy()
+    process_env["PYTHONUNBUFFERED"] = "1"
     process_env["DOUK_DETAIL_FETCH_CONCURRENCY"] = str(get_detail_fetch_concurrency())
     process_env["DOUK_FILE_DOWNLOAD_MAX_WORKERS"] = str(get_file_download_max_workers())
     process, stdout_log, stderr_log, stdout_handle, stderr_handle = _start_process_with_logs(
@@ -737,7 +893,100 @@ def _launch_detail_task(task_id: int, creator: dict, profile: dict, work_ids: li
     return task
 
 
+def _launch_batch_source_task(
+    task_id: int,
+    creator: dict,
+    profile: dict,
+    source_items: list[dict],
+    work_ids: list[str],
+    mode: str,
+) -> dict:
+    settings = read_engine_settings()
+    settings.update(build_settings_payload(profile, [creator]))
+    settings["root"] = _resolve_download_root(profile, settings)
+    target_folder_name = infer_creator_folder_name(creator)
+    settings["folder_name"] = target_folder_name
+    volume_path = _prepare_task_volume(task_id, settings)
+    if not WORKER_ISOLATED_BATCH_PATH.exists():
+        raise HTTPException(status_code=500, detail="Isolated batch worker script not found")
+    source_path = volume_path / "webui_batch_source.json"
+    source_path.write_text(
+        json.dumps(source_items, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        str(WORKER_ISOLATED_BATCH_PATH),
+        "--volume",
+        str(volume_path),
+        "--platform",
+        creator["platform"],
+        "--tab",
+        str(creator.get("tab") or "post"),
+        "--sec-user-id",
+        str(creator.get("sec_user_id") or ""),
+        "--mark",
+        str(creator.get("mark") or creator.get("name") or ""),
+        "--source-file",
+        str(source_path),
+    ]
+    process_env = os.environ.copy()
+    process_env["PYTHONUNBUFFERED"] = "1"
+    process_env["DOUK_FILE_DOWNLOAD_MAX_WORKERS"] = str(get_file_download_max_workers())
+    process, stdout_log, stderr_log, stdout_handle, stderr_handle = _start_process_with_logs(
+        task_id,
+        command,
+        str(ENGINE_PROJECT_ROOT),
+        env=process_env,
+    )
+    task = {
+        "id": task_id,
+        "creator_id": creator["id"],
+        "creator_name": creator["name"],
+        "platform": creator["platform"],
+        "profile_id": profile["id"],
+        "status": "running",
+        "mode": mode,
+        "item_count": len(work_ids),
+        "run_command": f"batch-worker {creator.get('tab') or 'post'} {len(work_ids)}",
+        "pid": process.pid,
+        "message": "Auto batch download worker started",
+        "stdout_log": stdout_log,
+        "stderr_log": stderr_log,
+        "exit_code": None,
+        "runtime_volume_path": str(volume_path),
+        "runtime_volume_cleaned_at": None,
+        "work_ids": list(work_ids),
+        "target_folder_name": target_folder_name,
+    }
+    PROCESS_REGISTRY[task_id] = {
+        "process": process,
+        "stdout": stdout_handle,
+        "stderr": stderr_handle,
+    }
+    return task
+
+
 def _build_queued_auto_task(task_id: int, creator: dict, profile: dict, work_ids: list[str], created_at: str) -> dict:
+    return _build_queued_auto_task_with_mode(
+        task_id,
+        creator,
+        profile,
+        work_ids,
+        created_at,
+        mode="auto_detail_download",
+    )
+
+
+def _build_queued_auto_task_with_mode(
+    task_id: int,
+    creator: dict,
+    profile: dict,
+    work_ids: list[str],
+    created_at: str,
+    *,
+    mode: str,
+) -> dict:
     target_folder_name = infer_creator_folder_name(creator)
     return {
         "id": task_id,
@@ -746,7 +995,7 @@ def _build_queued_auto_task(task_id: int, creator: dict, profile: dict, work_ids
         "platform": creator["platform"],
         "profile_id": profile["id"],
         "status": "queued",
-        "mode": "auto_detail_download",
+        "mode": mode,
         "item_count": len(work_ids),
         "run_command": "detail-worker " + " ".join(work_ids),
         "pid": None,
@@ -819,7 +1068,7 @@ def create_auto_works_download_task(
         raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
     created_at = now_iso()
     task_id = next_sqlite_task_id()
-    if count_running_auto_tasks() >= get_auto_download_task_max_concurrency():
+    if count_running_auto_tasks() >= AUTO_TASK_PARALLELISM:
         task = _build_queued_auto_task(task_id, creator, profile, payload.work_ids, created_at)
         task["auto_session_id"] = session_id
         return save_sqlite_task(task)
@@ -831,21 +1080,109 @@ def create_auto_works_download_task(
     return save_sqlite_task(task)
 
 
+def create_auto_creator_batch_task(
+    payload: DownloadWorksTaskCreate,
+    *,
+    session_id: str = "",
+    allow_when_scheduler_disabled: bool = False,
+):
+    if not allow_when_scheduler_disabled and not is_auto_download_scheduler_enabled():
+        raise HTTPException(status_code=409, detail="Auto download scheduler is disabled")
+    if is_risk_guard_active():
+        raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
+    creator = get_creator(payload.creator_id)
+    profile = get_profile(creator.get("profile_id") or 1)
+    record_low_quality_signal(
+        assess_low_quality_items(find_scan_items_by_work_ids(payload.creator_id, payload.work_ids))
+    )
+    if is_risk_guard_active():
+        raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
+    created_at = now_iso()
+    task_id = next_sqlite_task_id()
+    if count_running_auto_tasks() >= AUTO_TASK_PARALLELISM:
+        task = _build_queued_auto_task_with_mode(
+            task_id,
+            creator,
+            profile,
+            payload.work_ids,
+            created_at,
+            mode="auto_creator_batch_download",
+        )
+        task["auto_session_id"] = session_id
+        return save_sqlite_task(task)
+    with TASK_LAUNCH_LOCK:
+        task = _launch_creator_batch_task(
+            task_id,
+            creator,
+            profile,
+            payload.work_ids,
+            mode="auto_creator_batch_download",
+        )
+    task["auto_session_id"] = session_id
+    task["created_at"] = created_at
+    task["updated_at"] = created_at
+    return save_sqlite_task(task)
+
+
+def create_auto_batch_source_task(
+    *,
+    creator_id: int,
+    source_items: list[dict],
+    work_ids: list[str],
+    session_id: str = "",
+    allow_when_scheduler_disabled: bool = False,
+):
+    if not allow_when_scheduler_disabled and not is_auto_download_scheduler_enabled():
+        raise HTTPException(status_code=409, detail="Auto download scheduler is disabled")
+    if is_risk_guard_active():
+        raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
+    creator = get_creator(creator_id)
+    profile = get_profile(creator.get("profile_id") or 1)
+    created_at = now_iso()
+    task_id = next_sqlite_task_id()
+    if count_running_auto_tasks() >= AUTO_TASK_PARALLELISM:
+        task = _build_queued_auto_task_with_mode(
+            task_id,
+            creator,
+            profile,
+            work_ids,
+            created_at,
+            mode="auto_detail_download",
+        )
+        task["auto_session_id"] = session_id
+        task["message"] = "Auto batch task queued, waiting for available slot"
+        task["batch_source_items"] = source_items
+        return save_sqlite_task(task)
+    with TASK_LAUNCH_LOCK:
+        task = _launch_batch_source_task(
+            task_id,
+            creator,
+            profile,
+            source_items,
+            work_ids,
+            "auto_detail_download",
+        )
+    task["auto_session_id"] = session_id
+    task["created_at"] = created_at
+    task["updated_at"] = created_at
+    return save_sqlite_task(task)
+
+
 def dispatch_queued_auto_tasks() -> int:
     started = 0
     if is_auto_download_paused() or is_risk_guard_active():
         return started
-    available_slots = max(0, get_auto_download_task_max_concurrency() - count_running_auto_tasks())
+    available_slots = max(0, AUTO_TASK_PARALLELISM - count_running_auto_tasks())
     if available_slots <= 0:
         return started
     queued_tasks = [
-        task for task in list_sqlite_tasks_by_statuses(
-            mode="auto_detail_download",
+        task
+        for task in list_sqlite_tasks_by_statuses(
             statuses=("queued",),
-            limit=available_slots,
+            limit=max(available_slots * 4, 8),
             order_asc=True,
         )
-        if task.get("status") == "queued"
+        if task.get("status") == "queued" and task.get("mode") in AUTO_TASK_MODES
     ]
     for task in reversed(queued_tasks):
         if started >= available_slots:
@@ -853,13 +1190,31 @@ def dispatch_queued_auto_tasks() -> int:
         creator = get_creator(task["creator_id"])
         profile = get_profile(task.get("profile_id") or creator.get("profile_id") or 1)
         with TASK_LAUNCH_LOCK:
-            launched = _launch_detail_task(
-                task["id"],
-                creator,
-                profile,
-                list(task.get("work_ids") or []),
-                "auto_detail_download",
-            )
+            if task.get("mode") == "auto_creator_batch_download":
+                launched = _launch_creator_batch_task(
+                    task["id"],
+                    creator,
+                    profile,
+                    list(task.get("work_ids") or []),
+                    mode="auto_creator_batch_download",
+                )
+            elif task.get("batch_source_items"):
+                launched = _launch_batch_source_task(
+                    task["id"],
+                    creator,
+                    profile,
+                    list(task.get("batch_source_items") or []),
+                    list(task.get("work_ids") or []),
+                    "auto_detail_download",
+                )
+            else:
+                launched = _launch_detail_task(
+                    task["id"],
+                    creator,
+                    profile,
+                    list(task.get("work_ids") or []),
+                    "auto_detail_download",
+                )
         launched["auto_session_id"] = task.get("auto_session_id") or ""
         launched["created_at"] = task.get("created_at") or now_iso()
         launched["updated_at"] = now_iso()
@@ -950,9 +1305,50 @@ def stop_task(task_id: int):
     raise HTTPException(status_code=404, detail="Task not found")
 
 
+def stop_creator_workflow(creator_id: int) -> dict:
+    creator = get_creator(creator_id)
+    from .auto_download_runtime import request_stop_creator_workflow as request_stop_workflow
+
+    stop_request = request_stop_workflow(creator_id)
+    stopped_task_count = 0
+    stopped_task_ids: list[int] = []
+    affected_tasks = list_sqlite_tasks_by_statuses(creator_id=creator_id)
+    for task in affected_tasks:
+        if task.get("status") in {"running", "queued"}:
+            current = stop_task(int(task["id"]))
+            if current.get("status") == "stopped":
+                stopped_task_count += 1
+                stopped_task_ids.append(int(current["id"]))
+
+    if stop_request["was_running"]:
+        message = "已发送结束任务请求；当前扫描会在本次请求返回后停止，且不会继续为该账号入队下载。"
+    elif stopped_task_count or stop_request["removed_from_manual_queue"]:
+        message = "已结束该账号当前排队或下载任务。"
+    else:
+        message = "当前账号没有正在执行中的扫描、排队或下载任务。"
+
+    update_auto_download_result(
+        int(creator["id"]),
+        status="stopped",
+        message=message,
+        next_run_at=creator.get("auto_download_next_run_at"),
+        mark_run=False,
+        record_history=False,
+    )
+    return {
+        "creator_id": int(creator["id"]),
+        "stopped_task_count": stopped_task_count,
+        "stopped_task_ids": stopped_task_ids,
+        "removed_from_manual_queue": bool(stop_request["removed_from_manual_queue"]),
+        "scan_stop_requested": bool(stop_request["was_running"]),
+        "message": message,
+    }
+
+
 def clear_creator_task_records(creator_id: int, purge_download_history: bool = False) -> dict:
     creator = get_creator(creator_id)
     affected_tasks = list_sqlite_tasks_by_statuses(creator_id=creator_id)
+    scan_cache_rows = list_sqlite_scan_cache(creator_id)
     stopped_count = 0
     for task in affected_tasks:
         if task.get("status") in {"running", "queued"}:
@@ -962,15 +1358,19 @@ def clear_creator_task_records(creator_id: int, purge_download_history: bool = F
     deleted_count = delete_sqlite_tasks_by_creator(creator_id)
     deleted_download_records = 0
     resolved_work_ids = 0
+    deleted_scan_cache_count = 0
     if purge_download_history:
         creator["_task_rows"] = affected_tasks
-        creator["_scan_cache_rows"] = list_sqlite_scan_cache(creator_id)
+        creator["_scan_cache_rows"] = scan_cache_rows
         work_ids = collect_creator_work_ids_for_purge(creator)
         creator.pop("_task_rows", None)
         creator.pop("_scan_cache_rows", None)
         if work_ids:
             resolved_work_ids = len(work_ids)
             deleted_download_records = delete_downloaded_ids(work_ids)
+        deleted_scan_cache_count = len(scan_cache_rows)
+        delete_sqlite_scan_cache_for_creator(creator_id)
+        set_creator_initial_scan_completed(creator_id, False)
     clear_auto_download_runtime_state(creator_id)
     return {
         "creator_id": creator_id,
@@ -979,4 +1379,5 @@ def clear_creator_task_records(creator_id: int, purge_download_history: bool = F
         "purged_download_history": bool(purge_download_history),
         "resolved_work_ids": resolved_work_ids,
         "deleted_download_records": deleted_download_records,
+        "deleted_scan_cache_count": deleted_scan_cache_count,
     }

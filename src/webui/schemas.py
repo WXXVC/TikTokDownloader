@@ -88,7 +88,7 @@ class CreatorPage(BaseModel):
     items: list[CreatorListItem] = Field(default_factory=list)
     total: int = 0
     page: int = 1
-    page_size: int = 10
+    page_size: int = 100
 
 
 class HealthResponse(BaseModel):
@@ -132,13 +132,18 @@ class PanelConfig(BaseModel):
     quick_add_tab: str = "post"
     quick_add_auto_download_enabled: bool = False
     quick_add_auto_download_interval_minutes: int = 0
-    auto_download_task_max_concurrency: int = 1
     detail_fetch_concurrency: int = 2
     file_download_max_workers: int = 4
+    initial_account_scan_max_pages: int = 0
+    initial_account_scan_timeout_seconds: int = 180
+    incremental_account_scan_max_pages: int = 0
+    incremental_account_scan_timeout_seconds: int = 180
     auto_download_pause_mode: str = "works"
     auto_download_pause_after_works: int = 1000
+    auto_download_pause_window_minutes: int = 30
     auto_download_pause_after_creators: int = 10
     auto_download_pause_minutes: int = 5
+    auto_download_split_batches_enabled: bool = True
     auto_download_work_batch_size: int = 20
     risk_guard_enabled: bool = False
     risk_guard_cooldown_hours: int = 24
@@ -153,6 +158,7 @@ class PanelConfig(BaseModel):
 class AutoDownloadThrottleStatus(BaseModel):
     works_count: int = 0
     creators_count: int = 0
+    works_window_minutes: int = 30
     paused_until: datetime | None = None
     last_reason: str = ""
     is_paused: bool = False
@@ -236,7 +242,7 @@ class ScanPageResponse(BaseModel):
     undownloaded_count: int
     total_visible: int
     page: int = 1
-    page_size: int = 10
+    page_size: int = 50
     available_types: list[str] = Field(default_factory=list)
     items: list[ScanItem] = Field(default_factory=list)
 
@@ -287,7 +293,7 @@ class DownloadTaskPage(BaseModel):
     items: list[DownloadTaskListItem] = Field(default_factory=list)
     total: int = 0
     page: int = 1
-    page_size: int = 10
+    page_size: int = 100
 
 
 class RunningTaskCard(BaseModel):
@@ -319,7 +325,7 @@ class TaskCenterSummaryPage(BaseModel):
     items: list[TaskCenterSummaryItem] = Field(default_factory=list)
     total: int = 0
     page: int = 1
-    page_size: int = 10
+    page_size: int = 100
 
 
 class DownloadTaskCreate(BaseModel):

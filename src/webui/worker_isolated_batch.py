@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -31,10 +32,17 @@ def patch_project_root(volume_path: Path) -> None:
     volume_path.mkdir(parents=True, exist_ok=True)
 
 
-async def run_download(detail_ids: list[str], tiktok: bool) -> None:
+async def run_download(
+    source_file: Path,
+    platform: str,
+    tab: str,
+    sec_user_id: str,
+    mark: str,
+) -> None:
     from src.application.TikTokDownloader import TikTokDownloader
     from src.application.main_terminal import TikTok
 
+    source_items = json.loads(source_file.read_text(encoding="utf-8"))
     async with TikTokDownloader() as downloader:
         downloader.check_config()
         await downloader.check_settings(False)
@@ -43,22 +51,23 @@ async def run_download(detail_ids: list[str], tiktok: bool) -> None:
             downloader.database,
             server_mode=True,
         )
-        root, params, logger = app.record.run(app.parameter)
-        async with logger(root, console=app.console, **params) as record:
-            await app._handle_detail(
-                detail_ids,
-                tiktok,
-                record,
-                api=False,
-                source=False,
-            )
+        await app._batch_process_detail(
+            source_items,
+            tiktok=platform == "tiktok",
+            mode=tab or "post",
+            mark=mark or "",
+            user_id=sec_user_id or "",
+        )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--volume", required=True)
     parser.add_argument("--platform", choices=("douyin", "tiktok"), required=True)
-    parser.add_argument("--ids", nargs="+", required=True)
+    parser.add_argument("--tab", required=True)
+    parser.add_argument("--sec-user-id", required=True)
+    parser.add_argument("--mark", default="")
+    parser.add_argument("--source-file", required=True)
     return parser.parse_args()
 
 
@@ -67,13 +76,21 @@ def main() -> None:
     configure_stdio()
     patch_project_root(Path(args.volume))
     print(
-        f"[worker] isolated detail starting, platform={args.platform}, ids={len(args.ids)}",
+        f"[worker] isolated batch starting, platform={args.platform}, tab={args.tab}, source={args.source_file}",
         flush=True,
     )
     try:
-        asyncio.run(run_download(args.ids, args.platform == "tiktok"))
+        asyncio.run(
+            run_download(
+                Path(args.source_file),
+                args.platform,
+                args.tab,
+                args.sec_user_id,
+                args.mark,
+            )
+        )
     except Exception as error:
-        print(f"[worker] isolated detail crashed: {error!r}", file=sys.stderr, flush=True)
+        print(f"[worker] isolated batch crashed: {error!r}", file=sys.stderr, flush=True)
         raise
 
 

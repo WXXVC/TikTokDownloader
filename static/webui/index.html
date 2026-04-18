@@ -281,7 +281,11 @@
             <section class="engine-config-group">
               <h3>自动下载防过频暂停</h3>
               <div class="engine-form-grid">
-                <label class="checkbox field-checkbox engine-switch"><input name="auto_download_scheduler_enabled" type="checkbox" />开启全局自动下载调度</label>
+                <div class="field-label engine-field engine-switch-field">
+                  <span>调度开关</span>
+                  <label class="checkbox field-checkbox engine-switch"><input name="auto_download_scheduler_enabled" type="checkbox" />开启全局自动下载调度</label>
+                  <small class="field-help field-help-placeholder">  </small>
+                </div>
                 <label class="field-label engine-field">
                   <span>暂停模式</span>
                   <select name="auto_download_pause_mode">
@@ -293,23 +297,29 @@
                 <label class="field-label engine-field">
                   <span>作品数阈值</span>
                   <input name="auto_download_pause_after_works" type="number" min="0" placeholder="1000" />
-                  <small class="field-help">按作品数模式下，累计下载多少作品后暂停。</small>
+                  <small class="field-help">按作品数模式下，最近一个统计窗口内成功下载多少作品后暂停。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>统计窗口分钟数</span>
+                  <input name="auto_download_pause_window_minutes" type="number" min="1" placeholder="30" />
+                  <small class="field-help">只统计最近这段时间内的成功下载数量，避免长时间累计触发暂停。</small>
                 </label>
                 <label class="field-label engine-field">
                   <span>账号数阈值</span>
                   <input name="auto_download_pause_after_creators" type="number" min="0" placeholder="10" />
-                  <small class="field-help">按账号数模式下，累计处理多少账号后暂停。</small>
+                  <small class="field-help">按账号数模式下，最近一个统计窗口内处理多少账号后暂停。</small>
                 </label>
                 <label class="field-label engine-field">
                   <span>暂停分钟数</span>
                   <input name="auto_download_pause_minutes" type="number" min="1" placeholder="5" />
                   <small class="field-help">触发暂停后，等待多久再自动恢复。</small>
                 </label>
-                <label class="field-label engine-field">
-                  <span>自动批次并发数</span>
-                  <input name="auto_download_task_max_concurrency" type="number" min="1" placeholder="1" />
-                  <small class="field-help">同一时刻最多并行运行多少个自动下载批次。值越大速度越快，但也更容易压到下载引擎或网络。</small>
-                </label>
+              </div>
+            </section>
+
+            <section class="engine-config-group">
+              <h3>自动下载执行策略</h3>
+              <div class="engine-form-grid">
                 <label class="field-label engine-field">
                   <span>详情提取并发数</span>
                   <input name="detail_fetch_concurrency" type="number" min="1" placeholder="2" />
@@ -320,10 +330,35 @@
                   <input name="file_download_max_workers" type="number" min="1" placeholder="4" />
                   <small class="field-help">单个账号任务内部，同时下载多少个文件。视频、图集图片、音乐、封面共用这组并发。</small>
                 </label>
+                <div class="field-label engine-field engine-switch-field">
+                  <span>自动下载批次策略</span>
+                  <label class="checkbox field-checkbox engine-switch"><input name="auto_download_split_batches_enabled" type="checkbox" />自动下载时拆分批次</label>
+                  <small class="field-help">开启拆分后，每个账号一轮扫描会按这个数量切成多个顺序批次；关闭拆分时会按原始逻辑整批下载。</small>
+                </div>
                 <label class="field-label engine-field">
-                  <span>自动下载批次大小</span>
+                  <span>批次大小</span>
                   <input name="auto_download_work_batch_size" type="number" min="1" placeholder="20" />
-                  <small class="field-help">每个账号一轮扫描后，单个自动下载任务最多包含多少个作品。</small>
+                  <small class="field-help">拆分开启后，每批最多下载多少个作品。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>首次全量扫描页数上限</span>
+                  <input name="initial_account_scan_max_pages" type="number" min="0" placeholder="0" />
+                  <small class="field-help">新账号首次全量扫描时使用。0 表示不限制；喜欢页和收藏页也沿用这组设置。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>首次全量扫描超时秒数</span>
+                  <input name="initial_account_scan_timeout_seconds" type="number" min="10" placeholder="180" />
+                  <small class="field-help">新账号首次全量扫描请求最长等待多久；作品很多时建议调大。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>后续增量扫描页数上限</span>
+                  <input name="incremental_account_scan_max_pages" type="number" min="0" placeholder="0" />
+                  <small class="field-help">仅发布页在完成首次全量后使用。0 表示不限制；会配合历史扫描缓存尽量少翻页。</small>
+                </label>
+                <label class="field-label engine-field">
+                  <span>后续增量扫描超时秒数</span>
+                  <input name="incremental_account_scan_timeout_seconds" type="number" min="10" placeholder="180" />
+                  <small class="field-help">后续增量扫描请求最长等待多久；通常可以比首次全量更激进。</small>
                 </label>
               </div>
             </section>
@@ -488,6 +523,7 @@
               <option value="creator_batch_download">整号下载</option>
               <option value="detail_download">作品下载</option>
               <option value="auto_detail_download">自动扫描下载</option>
+              <option value="auto_creator_batch_download">自动整号下载</option>
             </select>
             <select id="task-filter-kind">
               <option value="">全部任务</option>

@@ -7,15 +7,20 @@ from uuid import uuid4
 
 import httpx
 
-from ..config import AUTO_DOWNLOAD_MAX_CONCURRENCY, AUTO_DOWNLOAD_WORK_BATCH_SIZE, DATA_DIR
+from ..config import AUTO_DOWNLOAD_WORK_BATCH_SIZE, DATA_DIR
 from ..schemas import DownloadWorksTaskCreate
 from . import scans
 from .auto_download_throttle import is_auto_download_paused
-from .creators import get_creator, list_due_auto_download_creators, update_auto_download_result
+from .creators import get_creator, has_creator_completed_initial_scan, list_due_auto_download_creators, set_creator_initial_scan_completed, update_auto_download_result
 from .engine import fetch_account_items
-from .panel_config import is_auto_download_scheduler_enabled, read_panel_config
+from .panel_config import (
+    is_auto_download_scheduler_enabled,
+    is_auto_download_split_batches_enabled,
+    read_panel_config,
+)
 from .risk_guard import is_risk_guard_active
 from .tasks import (
+    create_auto_batch_source_task,
     create_auto_works_download_task,
     has_active_auto_task_workload,
     has_running_task_for_creator,
@@ -29,7 +34,7 @@ AUTO_DOWNLOAD_WAKE_EVENT: asyncio.Event | None = None
 MANUAL_QUEUE: deque[int] = deque()
 MANUAL_QUEUE_SET: set[int] = set()
 MANUAL_QUEUE_LOADED = False
-PENDING_MANUAL_RUNS: set[int] = set()
+STOP_REQUESTED_CREATORS: set[int] = set()
 
 
 def _save_manual_queue() -> None:
@@ -86,6 +91,48 @@ def enqueue_manual_creator_run(creator_id: int) -> bool:
     _save_manual_queue()
     request_auto_download_wakeup()
     return True
+
+
+def remove_manual_creator_run(creator_id: int) -> bool:
+    _load_manual_queue()
+    creator_id = int(creator_id or 0)
+    if creator_id <= 0 or creator_id not in MANUAL_QUEUE_SET:
+        return False
+    remaining_ids = [int(item) for item in MANUAL_QUEUE if int(item or 0) != creator_id]
+    MANUAL_QUEUE.clear()
+    MANUAL_QUEUE_SET.clear()
+    for item in remaining_ids:
+        if item > 0 and item not in MANUAL_QUEUE_SET:
+            MANUAL_QUEUE.append(item)
+            MANUAL_QUEUE_SET.add(item)
+    _save_manual_queue()
+    request_auto_download_wakeup()
+    return True
+
+
+def request_stop_creator_workflow(creator_id: int) -> dict:
+    creator_id = int(creator_id or 0)
+    removed_from_manual_queue = remove_manual_creator_run(creator_id)
+    if creator_id > 0:
+        STOP_REQUESTED_CREATORS.add(creator_id)
+    request_auto_download_wakeup()
+    return {
+        "creator_id": creator_id,
+        "removed_from_manual_queue": removed_from_manual_queue,
+        "was_running": creator_id in RUNNING_CREATORS,
+    }
+
+
+def consume_stop_request(creator_id: int) -> bool:
+    creator_id = int(creator_id or 0)
+    if creator_id <= 0 or creator_id not in STOP_REQUESTED_CREATORS:
+        return False
+    STOP_REQUESTED_CREATORS.discard(creator_id)
+    return True
+
+
+def clear_stop_request(creator_id: int) -> None:
+    STOP_REQUESTED_CREATORS.discard(int(creator_id or 0))
 
 
 def get_manual_queue_state() -> dict:
@@ -147,15 +194,27 @@ def _next_run_after(creator: dict, base: datetime | None = None) -> datetime | N
     return anchor + timedelta(minutes=interval)
 
 
-def _scan_creator_once(creator_id: int) -> tuple[dict, list[str]]:
+def _source_item_id(item: dict) -> str:
+    return str(item.get("aweme_id") or item.get("id") or "")
+
+
+def _scan_creator_once(creator_id: int) -> tuple[dict, list[str], list[dict]]:
     creator = get_creator(creator_id)
-    engine_items = scans.map_engine_items(fetch_account_items(creator))
+    source_items = fetch_account_items(creator)
+    engine_items = scans.map_engine_items(source_items)
     payload = scans.build_scan_payload(creator, engine_items, "engine_api_auto")
     work_ids = [item.id for item in payload["items"] if not item.is_downloaded]
-    return payload, work_ids
+    work_id_set = {str(item) for item in work_ids}
+    filtered_source_items = [
+        item for item in source_items
+        if _source_item_id(item) in work_id_set
+    ]
+    return payload, work_ids, filtered_source_items
 
 
 def _split_work_ids(work_ids: list[str]) -> list[list[str]]:
+    if not is_auto_download_split_batches_enabled():
+        return [list(work_ids)] if work_ids else []
     config = read_panel_config()
     size = max(
         1,
@@ -166,12 +225,13 @@ def _split_work_ids(work_ids: list[str]) -> list[list[str]]:
 
 async def request_manual_creator_run(creator: dict) -> None:
     creator_id = int(creator["id"])
-    if creator_id in RUNNING_CREATORS or creator_id in PENDING_MANUAL_RUNS:
+    clear_stop_request(creator_id)
+    if creator_id in RUNNING_CREATORS:
         await asyncio.to_thread(
             update_auto_download_result,
             creator_id,
             status="queued",
-            message="该账号已在手动执行队列中，正在等待后台继续处理。",
+            message="该账号正在处理中，请等待当前这一轮完成。",
             next_run_at=datetime.now().isoformat(timespec="seconds"),
             mark_run=False,
             record_history=False,
@@ -188,37 +248,27 @@ async def request_manual_creator_run(creator: dict) -> None:
             record_history=False,
         )
         return
-    if await asyncio.to_thread(has_active_auto_task_workload, creator_id):
-        enqueue_manual_creator_run(creator_id)
-        await asyncio.to_thread(
-            update_auto_download_result,
-            creator_id,
-            status="queued",
-            message="当前有其他账号正在自动下载，已加入手动顺序队列，前一账号整轮完成后会自动开始。",
-            next_run_at=datetime.now().isoformat(timespec="seconds"),
-            mark_run=False,
-            record_history=False,
+
+    queued_now = await asyncio.to_thread(enqueue_manual_creator_run, creator_id)
+    has_other_active_workload = await asyncio.to_thread(has_active_auto_task_workload)
+    if queued_now:
+        message = (
+            "已收到手动执行请求，已加入手动顺序队列。当前任务完成后会自动开始扫描和下载。"
+            if has_other_active_workload or len(RUNNING_CREATORS) > 0
+            else "已收到手动执行请求，正在等待调度器启动扫描和下载。"
         )
-        return
-    PENDING_MANUAL_RUNS.add(creator_id)
+    else:
+        message = "该账号已在手动执行队列中，正在等待后台继续处理。"
+
     await asyncio.to_thread(
         update_auto_download_result,
         creator_id,
         status="queued",
-        message="已收到手动执行请求，正在后台准备扫描。",
+        message=message,
         next_run_at=datetime.now().isoformat(timespec="seconds"),
         mark_run=False,
         record_history=False,
     )
-
-    async def _run_in_background() -> None:
-        try:
-            latest_creator = await asyncio.to_thread(get_creator, creator_id)
-            await run_once_for_creator(latest_creator, force=True)
-        finally:
-            PENDING_MANUAL_RUNS.discard(creator_id)
-
-    asyncio.create_task(_run_in_background())
 
 
 async def run_once_for_creator(creator: dict, *, force: bool = False) -> None:
@@ -231,24 +281,35 @@ async def run_once_for_creator(creator: dict, *, force: bool = False) -> None:
         return
     RUNNING_CREATORS.add(creator_id)
     try:
+        if consume_stop_request(creator_id):
+            await asyncio.to_thread(
+                update_auto_download_result,
+                creator_id,
+                status="stopped",
+                message="已停止当前账号任务，本轮不会继续扫描或入队下载。",
+                next_run_at=_next_run_after(creator),
+                mark_run=False,
+                record_history=False,
+            )
+            return
         if await asyncio.to_thread(has_running_task_for_creator, creator_id):
             await asyncio.to_thread(
                 update_auto_download_result,
                 creator_id,
                 status="skipped",
-                message="当前账号已有运行中的自动下载任务，本轮跳过。",
+                message="当前账号已有正在运行的自动下载任务，本轮跳过。",
                 next_run_at=_next_run_after(creator),
                 mark_run=False,
             )
             return
         if await asyncio.to_thread(has_active_auto_task_workload, creator_id):
             if force:
-                enqueue_manual_creator_run(creator_id)
+                await asyncio.to_thread(enqueue_manual_creator_run, creator_id)
                 await asyncio.to_thread(
                     update_auto_download_result,
                     creator_id,
                     status="queued",
-                    message="当前有其他账号正在自动下载，已加入手动顺序队列，前一账号整轮完成后会自动开始。",
+                    message="当前有其他账号正在自动下载，已加入手动顺序队列，上一账号完成后会自动开始。",
                     next_run_at=datetime.now().isoformat(timespec="seconds"),
                     mark_run=False,
                     record_history=False,
@@ -259,14 +320,27 @@ async def run_once_for_creator(creator: dict, *, force: bool = False) -> None:
             update_auto_download_result,
             creator_id,
             status="scanning",
-            message="正在扫描账号作品并比对已下载记录，请稍候。",
+            message="正在扫描账号作品并比对数据库中的已下载记录，请稍候。",
             next_run_at=_next_run_after(creator),
             mark_run=False,
             record_history=False,
         )
-        payload, work_ids = await asyncio.to_thread(_scan_creator_once, creator_id)
+        payload, work_ids, filtered_source_items = await asyncio.to_thread(_scan_creator_once, creator_id)
         creator = await asyncio.to_thread(get_creator, creator_id)
+        if consume_stop_request(creator_id):
+            await asyncio.to_thread(
+                update_auto_download_result,
+                creator_id,
+                status="stopped",
+                message="已收到结束任务请求；当前扫描结果已丢弃，不会继续为该账号入队下载任务。",
+                next_run_at=_next_run_after(creator),
+                mark_run=False,
+                record_history=False,
+            )
+            return
         if not work_ids:
+            if not has_creator_completed_initial_scan(creator):
+                await asyncio.to_thread(set_creator_initial_scan_completed, creator_id, True)
             await asyncio.to_thread(
                 update_auto_download_result,
                 creator_id,
@@ -276,35 +350,60 @@ async def run_once_for_creator(creator: dict, *, force: bool = False) -> None:
             )
             return
 
+        split_batches_enabled = is_auto_download_split_batches_enabled()
         batches = _split_work_ids(work_ids)
         session_id = uuid4().hex
+        queue_message = (
+            f"扫描完成，发现 {len(work_ids)} 个待下载作品，正在拆分为 {len(batches)} 个顺序批次并加入下载队列。"
+            if split_batches_enabled
+            else f"扫描完成，发现 {len(work_ids)} 个待下载作品，正在按单批作品 ID 下载模式加入下载队列。"
+        )
         await asyncio.to_thread(
             update_auto_download_result,
             creator_id,
             status="queueing",
-            message=(
-                f"扫描完成，发现 {len(work_ids)} 个待下载作品，"
-                f"正在拆分为 {len(batches)} 个批次并加入下载队列。"
-            ),
+            message=queue_message,
             next_run_at=_next_run_after(creator),
             mark_run=False,
             record_history=False,
         )
+
         for batch_work_ids in batches:
-            await asyncio.to_thread(
-                create_auto_works_download_task,
-                DownloadWorksTaskCreate(creator_id=creator_id, work_ids=batch_work_ids),
-                session_id=session_id,
-                allow_when_scheduler_disabled=force,
+            if split_batches_enabled:
+                await asyncio.to_thread(
+                    create_auto_works_download_task,
+                    DownloadWorksTaskCreate(creator_id=creator_id, work_ids=batch_work_ids),
+                    session_id=session_id,
+                    allow_when_scheduler_disabled=force,
+                )
+            else:
+                await asyncio.to_thread(
+                    create_auto_batch_source_task,
+                    creator_id=creator_id,
+                    source_items=list(filtered_source_items),
+                    work_ids=list(batch_work_ids),
+                    session_id=session_id,
+                    allow_when_scheduler_disabled=force,
+                )
+
+        if split_batches_enabled:
+            finish_message = (
+                f"当前账号扫描完成，新增待下载作品 {len(work_ids)} 个，"
+                f"已拆分为 {len(batches)} 个顺序批次，当前账号完成前不会切换到下一个账号。"
             )
+            finish_status = "running" if len(batches) > 1 else "scheduled"
+        else:
+            finish_message = (
+                f"当前账号扫描完成，新增待下载作品 {len(work_ids)} 个，"
+                "已按单批作品 ID 下载模式入队，不再重复整号扫描，当前账号完成前不会切换到下一个账号。"
+            )
+            finish_status = "scheduled"
+
         await asyncio.to_thread(
             update_auto_download_result,
             creator_id,
-            status="running" if len(batches) > 1 else "scheduled",
-            message=(
-                f"当前账号扫描完成，新增待下载作品 {len(work_ids)} 个，"
-                f"已拆分为 {len(batches)} 个顺序批次，当前账号完成前不会切换到下一个账号。"
-            ),
+            status=finish_status,
+            message=finish_message,
             next_run_at=_next_run_after(creator),
         )
     except Exception as error:
@@ -378,18 +477,14 @@ async def scheduler_loop(stop_event: asyncio.Event) -> None:
             for creator in await asyncio.to_thread(
                 list_due_auto_download_creators,
                 now.isoformat(timespec="seconds"),
-                AUTO_DOWNLOAD_MAX_CONCURRENCY * 4,
+                1,
             )
             if int(creator["id"]) not in RUNNING_CREATORS
         ]
 
         if due_creators:
-            slots = max(1, AUTO_DOWNLOAD_MAX_CONCURRENCY - len(RUNNING_CREATORS))
-            batch = due_creators[:slots]
-            if batch:
-                for creator in batch:
-                    if await asyncio.to_thread(is_auto_download_paused) or await asyncio.to_thread(is_risk_guard_active):
-                        break
-                    await run_once_for_creator(creator)
+            creator = due_creators[0]
+            if not await asyncio.to_thread(is_auto_download_paused) and not await asyncio.to_thread(is_risk_guard_active):
+                await run_once_for_creator(creator)
                 continue
         await _wait_for_next_cycle(stop_event)

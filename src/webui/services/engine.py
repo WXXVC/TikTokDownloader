@@ -20,7 +20,8 @@ from ..config import (
     get_engine_api_base,
     get_engine_api_token,
 )
-from ..db import update_sqlite_creator_sec_user_id
+from ..db import list_sqlite_scan_cache, update_sqlite_creator_sec_user_id
+from .panel_config import read_panel_config
 from src.custom import DATA_HEADERS, DATA_HEADERS_TIKTOK
 from src.interface.info import Info
 from src.interface.info_tiktok import InfoTikTok
@@ -32,6 +33,7 @@ from src.tools import create_client
 DOUYIN_USER_PATTERN = re.compile(r"/user/([^/?]+)")
 TIKTOK_SECUID_PATTERN = re.compile(r"[?&]secUid=([^&]+)")
 SETTINGS_ENCODING = "utf-8-sig" if system() == "Windows" else "utf-8"
+INCREMENTAL_SCAN_ANCHOR_COUNT = 20
 
 ENGINE_CONFIG_DEFAULTS = {
     "desc_length": 64,
@@ -102,6 +104,78 @@ def normalize_download_root(root: str) -> str:
             relative = normalized[len(prefix):].strip("/")
             return str(ENGINE_VOLUME_PATH.joinpath(*relative.split("/"))) if relative else str(ENGINE_VOLUME_PATH)
     return value
+
+
+def _resolve_incremental_scan_earliest(creator: dict) -> str:
+    if str(creator.get("tab") or "post") != "post":
+        return ""
+    creator_id = int(creator.get("id") or 0)
+    if creator_id <= 0:
+        return ""
+    anchor_dates: list[datetime] = []
+    for row in list_sqlite_scan_cache(creator_id):
+        for item in row.get("payload") or []:
+            published_at = str(item.get("published_at") or "").strip()
+            if not published_at:
+                continue
+            try:
+                published_dt = datetime.strptime(published_at, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            anchor_dates.append(published_dt)
+            if len(anchor_dates) >= INCREMENTAL_SCAN_ANCHOR_COUNT:
+                break
+        if anchor_dates:
+            break
+    if not anchor_dates:
+        return ""
+    # Use a small window of recent cached works instead of a single latest item so
+    # a deleted newest work does not immediately invalidate incremental scanning.
+    earliest_anchor = min(anchor_dates)
+    # Keep a one-day buffer so same-day ordering shifts or deletions do not cause misses.
+    return (earliest_anchor - timedelta(days=1)).strftime("%Y/%m/%d")
+
+
+def _has_completed_initial_scan(creator: dict) -> bool:
+    state = creator.get("initial_scan_completed")
+    if state is not None:
+        return bool(state)
+    if str(creator.get("auto_download_last_status") or "").strip().lower() in {"success", "idle"}:
+        return True
+    for history_item in creator.get("auto_download_history") or []:
+        if str(history_item.get("status") or "").strip().lower() in {"success", "idle"}:
+            return True
+    creator_id = int(creator.get("id") or 0)
+    if creator_id <= 0:
+        return False
+    return bool(list_sqlite_scan_cache(creator_id))
+
+
+def _resolve_scan_strategy(creator: dict, panel_config: dict) -> tuple[str, int, int]:
+    tab = str(creator.get("tab") or "post")
+    if tab == "post" and _has_completed_initial_scan(creator):
+        return (
+            "incremental",
+            max(0, int(panel_config.get("incremental_account_scan_max_pages") or 0)),
+            max(
+                10,
+                int(
+                    panel_config.get("incremental_account_scan_timeout_seconds")
+                    or ENGINE_API_ACCOUNT_TIMEOUT_SECONDS
+                ),
+            ),
+        )
+    return (
+        "initial_full",
+        max(0, int(panel_config.get("initial_account_scan_max_pages") or 0)),
+        max(
+            10,
+            int(
+                panel_config.get("initial_account_scan_timeout_seconds")
+                or ENGINE_API_ACCOUNT_TIMEOUT_SECONDS
+            ),
+        ),
+    )
 
 
 def read_downloaded_ids(force_refresh: bool = False) -> set[str]:
@@ -369,14 +443,18 @@ def fetch_account_items(creator: dict) -> list[dict]:
     sec_user_id = resolve_creator_identity(creator)
     if not sec_user_id:
         raise ValueError("Unable to resolve sec_user_id from creator url")
+    panel_config = read_panel_config()
+    scan_strategy, max_pages, timeout_seconds = _resolve_scan_strategy(creator, panel_config)
     path = "/tiktok/account" if creator["platform"] == "tiktok" else "/douyin/account"
-    data = _post(
-        path,
-        {
-            "sec_user_id": sec_user_id,
-            "tab": creator.get("tab") or "post",
-            "source": False,
-        },
-        timeout=ENGINE_API_ACCOUNT_TIMEOUT_SECONDS,
-    )
+    payload = {
+        "sec_user_id": sec_user_id,
+        "tab": creator.get("tab") or "post",
+        "source": True,
+    }
+    if max_pages > 0:
+        payload["pages"] = max_pages
+    earliest = _resolve_incremental_scan_earliest(creator) if scan_strategy == "incremental" else ""
+    if earliest:
+        payload["earliest"] = earliest
+    data = _post(path, payload, timeout=timeout_seconds)
     return data.get("data") or []

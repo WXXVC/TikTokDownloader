@@ -38,6 +38,9 @@ WORKER_ISOLATED_MAIN_PATH = (
 WORKER_ISOLATED_DETAIL_PATH = (
     PROJECT_ROOT / "src" / "webui" / "worker_isolated_detail.py"
 )
+WORKER_ISOLATED_BATCH_PATH = (
+    PROJECT_ROOT / "src" / "webui" / "worker_isolated_batch.py"
+)
 ENGINE_VOLUME_PATH = Path(os.getenv("ENGINE_VOLUME_PATH", ENGINE_PROJECT_ROOT / "Volume"))
 ENGINE_DB_PATH = ENGINE_VOLUME_PATH / "DouK-Downloader.db"
 ENGINE_SETTINGS_PATH = ENGINE_VOLUME_PATH / "settings.json"

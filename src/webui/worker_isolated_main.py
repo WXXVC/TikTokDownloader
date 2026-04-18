@@ -14,7 +14,12 @@ def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
-            reconfigure(encoding="utf-8", errors="backslashreplace")
+            reconfigure(
+                encoding="utf-8",
+                errors="backslashreplace",
+                line_buffering=True,
+                write_through=True,
+            )
 
 
 def patch_project_root(volume_path: Path) -> None:
@@ -43,7 +48,12 @@ def main() -> None:
     args = parse_args()
     configure_stdio()
     patch_project_root(Path(args.volume))
-    asyncio.run(run_downloader())
+    print(f"[worker] isolated main starting, volume={args.volume}", flush=True)
+    try:
+        asyncio.run(run_downloader())
+    except Exception as error:
+        print(f"[worker] isolated main crashed: {error!r}", file=sys.stderr, flush=True)
+        raise
 
 
 if __name__ == "__main__":
