@@ -8,10 +8,15 @@ from uuid import uuid4
 import httpx
 
 from ..config import AUTO_DOWNLOAD_WORK_BATCH_SIZE, DATA_DIR
-from ..schemas import DownloadWorksTaskCreate
 from . import scans
 from .auto_download_throttle import is_auto_download_paused
-from .creators import get_creator, has_creator_completed_initial_scan, list_due_auto_download_creators, set_creator_initial_scan_completed, update_auto_download_result
+from .creators import (
+    get_creator,
+    has_creator_completed_initial_scan,
+    list_due_auto_download_creators,
+    set_creator_initial_scan_completed,
+    update_auto_download_result,
+)
 from .engine import fetch_account_items
 from .panel_config import (
     is_auto_download_scheduler_enabled,
@@ -21,7 +26,6 @@ from .panel_config import (
 from .risk_guard import is_risk_guard_active
 from .tasks import (
     create_auto_batch_source_task,
-    create_auto_works_download_task,
     has_active_auto_task_workload,
     has_running_task_for_creator,
 )
@@ -39,7 +43,9 @@ STOP_REQUESTED_CREATORS: set[int] = set()
 
 def _save_manual_queue() -> None:
     payload = {
-        "creator_ids": [creator_id for creator_id in MANUAL_QUEUE if int(creator_id or 0) > 0],
+        "creator_ids": [
+            creator_id for creator_id in MANUAL_QUEUE if int(creator_id or 0) > 0
+        ],
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     MANUAL_QUEUE_PATH.write_text(
@@ -137,7 +143,9 @@ def clear_stop_request(creator_id: int) -> None:
 
 def get_manual_queue_state() -> dict:
     _load_manual_queue()
-    creator_ids = [int(creator_id) for creator_id in MANUAL_QUEUE if int(creator_id or 0) > 0]
+    creator_ids = [
+        int(creator_id) for creator_id in MANUAL_QUEUE if int(creator_id or 0) > 0
+    ]
     next_creator = None
     if creator_ids:
         try:
@@ -206,8 +214,7 @@ def _scan_creator_once(creator_id: int) -> tuple[dict, list[str], list[dict]]:
     work_ids = [item.id for item in payload["items"] if not item.is_downloaded]
     work_id_set = {str(item) for item in work_ids}
     filtered_source_items = [
-        item for item in source_items
-        if _source_item_id(item) in work_id_set
+        item for item in source_items if _source_item_id(item) in work_id_set
     ]
     return payload, work_ids, filtered_source_items
 
@@ -218,9 +225,32 @@ def _split_work_ids(work_ids: list[str]) -> list[list[str]]:
     config = read_panel_config()
     size = max(
         1,
-        int(config.get("auto_download_work_batch_size") or AUTO_DOWNLOAD_WORK_BATCH_SIZE),
+        int(
+            config.get("auto_download_work_batch_size") or AUTO_DOWNLOAD_WORK_BATCH_SIZE
+        ),
     )
-    return [work_ids[index:index + size] for index in range(0, len(work_ids), size)]
+    return [work_ids[index : index + size] for index in range(0, len(work_ids), size)]
+
+
+def _split_source_items_by_batches(
+    source_items: list[dict],
+    batches: list[list[str]],
+) -> list[list[dict]]:
+    if not batches:
+        return []
+    source_item_map: dict[str, dict] = {}
+    for item in source_items:
+        item_id = _source_item_id(item)
+        if item_id and item_id not in source_item_map:
+            source_item_map[item_id] = item
+    return [
+        [
+            source_item_map[work_id]
+            for work_id in batch_work_ids
+            if work_id in source_item_map
+        ]
+        for batch_work_ids in batches
+    ]
 
 
 async def request_manual_creator_run(creator: dict) -> None:
@@ -277,7 +307,9 @@ async def run_once_for_creator(creator: dict, *, force: bool = False) -> None:
         return
     if not force and not await asyncio.to_thread(is_auto_download_scheduler_enabled):
         return
-    if await asyncio.to_thread(is_auto_download_paused) or await asyncio.to_thread(is_risk_guard_active):
+    if await asyncio.to_thread(is_auto_download_paused) or await asyncio.to_thread(
+        is_risk_guard_active
+    ):
         return
     RUNNING_CREATORS.add(creator_id)
     try:
@@ -325,7 +357,9 @@ async def run_once_for_creator(creator: dict, *, force: bool = False) -> None:
             mark_run=False,
             record_history=False,
         )
-        payload, work_ids, filtered_source_items = await asyncio.to_thread(_scan_creator_once, creator_id)
+        payload, work_ids, filtered_source_items = await asyncio.to_thread(
+            _scan_creator_once, creator_id
+        )
         creator = await asyncio.to_thread(get_creator, creator_id)
         if consume_stop_request(creator_id):
             await asyncio.to_thread(
@@ -340,7 +374,9 @@ async def run_once_for_creator(creator: dict, *, force: bool = False) -> None:
             return
         if not work_ids:
             if not has_creator_completed_initial_scan(creator):
-                await asyncio.to_thread(set_creator_initial_scan_completed, creator_id, True)
+                await asyncio.to_thread(
+                    set_creator_initial_scan_completed, creator_id, True
+                )
             await asyncio.to_thread(
                 update_auto_download_result,
                 creator_id,
@@ -352,6 +388,9 @@ async def run_once_for_creator(creator: dict, *, force: bool = False) -> None:
 
         split_batches_enabled = is_auto_download_split_batches_enabled()
         batches = _split_work_ids(work_ids)
+        batch_source_items = _split_source_items_by_batches(
+            filtered_source_items, batches
+        )
         session_id = uuid4().hex
         queue_message = (
             f"扫描完成，发现 {len(work_ids)} 个待下载作品，正在拆分为 {len(batches)} 个顺序批次并加入下载队列。"
@@ -368,23 +407,15 @@ async def run_once_for_creator(creator: dict, *, force: bool = False) -> None:
             record_history=False,
         )
 
-        for batch_work_ids in batches:
-            if split_batches_enabled:
-                await asyncio.to_thread(
-                    create_auto_works_download_task,
-                    DownloadWorksTaskCreate(creator_id=creator_id, work_ids=batch_work_ids),
-                    session_id=session_id,
-                    allow_when_scheduler_disabled=force,
-                )
-            else:
-                await asyncio.to_thread(
-                    create_auto_batch_source_task,
-                    creator_id=creator_id,
-                    source_items=list(filtered_source_items),
-                    work_ids=list(batch_work_ids),
-                    session_id=session_id,
-                    allow_when_scheduler_disabled=force,
-                )
+        for batch_work_ids, batch_items in zip(batches, batch_source_items):
+            await asyncio.to_thread(
+                create_auto_batch_source_task,
+                creator_id=creator_id,
+                source_items=list(batch_items),
+                work_ids=list(batch_work_ids),
+                session_id=session_id,
+                allow_when_scheduler_disabled=force,
+            )
 
         if split_batches_enabled:
             finish_message = (
@@ -467,7 +498,9 @@ async def scheduler_loop(stop_event: asyncio.Event) -> None:
         if not await asyncio.to_thread(is_auto_download_scheduler_enabled):
             await _wait_for_next_cycle(stop_event)
             continue
-        if await asyncio.to_thread(is_auto_download_paused) or await asyncio.to_thread(is_risk_guard_active):
+        if await asyncio.to_thread(is_auto_download_paused) or await asyncio.to_thread(
+            is_risk_guard_active
+        ):
             await _wait_for_next_cycle(stop_event)
             continue
 
@@ -484,7 +517,9 @@ async def scheduler_loop(stop_event: asyncio.Event) -> None:
 
         if due_creators:
             creator = due_creators[0]
-            if not await asyncio.to_thread(is_auto_download_paused) and not await asyncio.to_thread(is_risk_guard_active):
+            if not await asyncio.to_thread(
+                is_auto_download_paused
+            ) and not await asyncio.to_thread(is_risk_guard_active):
                 await run_once_for_creator(creator)
                 continue
         await _wait_for_next_cycle(stop_event)

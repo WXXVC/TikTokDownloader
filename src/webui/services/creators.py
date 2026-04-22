@@ -15,6 +15,7 @@ from ..db import (
     list_sqlite_creators,
     now_iso,
     save_sqlite_creator,
+    delete_task_center_cache,
 )
 from ..schemas import CreatorCreate, CreatorQuickAddRequest, CreatorUpdate
 from .engine import (
@@ -33,7 +34,10 @@ def has_creator_completed_initial_scan(item: dict) -> bool:
     state = item.get("initial_scan_completed")
     if state is not None:
         return bool(state)
-    if str(item.get("auto_download_last_status") or "").strip().lower() in {"success", "idle"}:
+    if str(item.get("auto_download_last_status") or "").strip().lower() in {
+        "success",
+        "idle",
+    }:
         return True
     for history_item in item.get("auto_download_history") or []:
         if str(history_item.get("status") or "").strip().lower() in {"success", "idle"}:
@@ -56,7 +60,11 @@ def set_creator_initial_scan_completed(creator_id: int, completed: bool) -> dict
 def _normalize_schedule_fields(item: dict) -> None:
     interval = max(0, int(item.get("auto_download_interval_minutes") or 0))
     item["auto_download_interval_minutes"] = interval
-    enabled = bool(item.get("auto_download_enabled")) and interval > 0 and bool(item.get("enabled", True))
+    enabled = (
+        bool(item.get("auto_download_enabled"))
+        and interval > 0
+        and bool(item.get("enabled", True))
+    )
     item["auto_download_enabled"] = enabled
 
     start_at = item.get("auto_download_start_at")
@@ -78,7 +86,11 @@ def _normalize_schedule_fields(item: dict) -> None:
         if next_run_at:
             item["auto_download_next_run_at"] = next_run_at
             return
-        base = datetime.fromisoformat(start_at) if start_at else (datetime.now() + timedelta(minutes=interval))
+        base = (
+            datetime.fromisoformat(start_at)
+            if start_at
+            else (datetime.now() + timedelta(minutes=interval))
+        )
         if base < datetime.now():
             base = datetime.now() + timedelta(minutes=interval)
         item["auto_download_next_run_at"] = base.isoformat(timespec="seconds")
@@ -89,7 +101,11 @@ def _normalize_schedule_fields(item: dict) -> None:
 
 def _resolve_next_run_at(item: dict) -> str | None:
     interval = max(0, int(item.get("auto_download_interval_minutes") or 0))
-    enabled = bool(item.get("auto_download_enabled")) and interval > 0 and bool(item.get("enabled", True))
+    enabled = (
+        bool(item.get("auto_download_enabled"))
+        and interval > 0
+        and bool(item.get("enabled", True))
+    )
     if not enabled:
         return None
 
@@ -125,12 +141,17 @@ def update_auto_download_result(
     item["auto_download_last_message"] = message
     if record_history:
         history = list(item.get("auto_download_history") or [])
-        history.insert(0, {
-            "run_at": item["auto_download_last_run_at"] if mark_run else now_iso(),
-            "status": status,
-            "message": message,
-            "next_run_at": next_run_at.isoformat(timespec="seconds") if hasattr(next_run_at, "isoformat") else (str(next_run_at) if next_run_at is not None else None),
-        })
+        history.insert(
+            0,
+            {
+                "run_at": item["auto_download_last_run_at"] if mark_run else now_iso(),
+                "status": status,
+                "message": message,
+                "next_run_at": next_run_at.isoformat(timespec="seconds")
+                if hasattr(next_run_at, "isoformat")
+                else (str(next_run_at) if next_run_at is not None else None),
+            },
+        )
         item["auto_download_history"] = history[:10]
     if next_run_at is None:
         item["auto_download_next_run_at"] = None
@@ -186,9 +207,9 @@ def list_creator_page(
     profile_id: int | None = None,
     enabled: str = "",
     auto_enabled: str = "",
-    auto_status: str = "",
+    download_status: str = "",
 ):
-    from .tasks import refresh_active_task_statuses
+    from .tasks import refresh_active_task_statuses, get_creator_download_status
 
     refresh_active_task_statuses()
     return list_sqlite_creator_summaries_paginated(
@@ -199,7 +220,8 @@ def list_creator_page(
         profile_id=profile_id,
         enabled=enabled,
         auto_enabled=auto_enabled,
-        auto_status=auto_status,
+        download_status=download_status,
+        get_creator_download_status=get_creator_download_status,
     )
 
 
@@ -222,7 +244,12 @@ def get_creator(creator_id: int):
 
 
 def _normalize_creator_identity_fields(item: dict) -> None:
-    item["platform"] = str(item.get("platform") or detect_platform_from_url(item.get("url") or "")).strip().lower() or "douyin"
+    item["platform"] = (
+        str(item.get("platform") or detect_platform_from_url(item.get("url") or ""))
+        .strip()
+        .lower()
+        or "douyin"
+    )
     item["url"] = normalize_creator_url(item.get("url") or "")
     item["name"] = str(item.get("name") or "").strip()
     item["mark"] = str(item.get("mark") or "").strip()
@@ -261,10 +288,128 @@ def _ensure_creator_not_duplicate(item: dict, *, exclude_id: int | None = None) 
             continue
         existing_sec_user_id = str(creator.get("sec_user_id") or "").strip()
         existing_url = normalize_creator_url(creator.get("url") or "")
-        same_sec_user = bool(incoming_sec_user_id) and incoming_sec_user_id == existing_sec_user_id
+        same_sec_user = (
+            bool(incoming_sec_user_id) and incoming_sec_user_id == existing_sec_user_id
+        )
         same_url = bool(incoming_url) and incoming_url == existing_url
         if same_sec_user or same_url:
             raise HTTPException(status_code=409, detail="Creator already exists")
+
+
+def find_existing_creator_by_identity(item: dict) -> dict | None:
+    incoming_sec_user_id = str(item.get("sec_user_id") or "").strip()
+    incoming_url = normalize_creator_url(item.get("url") or "")
+    for creator in list_sqlite_creators():
+        existing_sec_user_id = str(creator.get("sec_user_id") or "").strip()
+        existing_url = normalize_creator_url(creator.get("url") or "")
+        same_sec_user = (
+            bool(incoming_sec_user_id) and incoming_sec_user_id == existing_sec_user_id
+        )
+        same_url = bool(incoming_url) and incoming_url == existing_url
+        if same_sec_user or same_url:
+            return creator
+    return None
+
+
+def validate_script_access_password(password: str) -> None:
+    expected = str(read_panel_config().get("access_password") or "151150")
+    if str(password or "") != expected:
+        raise HTTPException(status_code=401, detail="Invalid access password")
+
+
+def upsert_creator_from_script(payload: dict) -> dict:
+    validate_script_access_password(payload.get("password") or "")
+    config = read_panel_config()
+    enabled = bool(payload["enabled"]) if "enabled" in payload else True
+    auto_download_enabled = (
+        bool(payload["auto_download_enabled"])
+        if "auto_download_enabled" in payload
+        else bool(config.get("quick_add_auto_download_enabled"))
+    )
+    auto_download_interval_minutes = max(
+        0,
+        int(
+            payload["auto_download_interval_minutes"]
+            if "auto_download_interval_minutes" in payload
+            else (config.get("quick_add_auto_download_interval_minutes") or 0)
+        ),
+    )
+    item = {
+        "platform": payload.get("platform")
+        or detect_platform_from_url(payload.get("url") or ""),
+        "name": str(payload.get("name") or "").strip(),
+        "mark": str(payload.get("mark") or payload.get("name") or "").strip(),
+        "url": payload.get("url") or "",
+        "sec_user_id": payload.get("sec_user_id") or "",
+        "tab": payload.get("tab") or str(config.get("quick_add_tab") or "post"),
+        "enabled": enabled,
+        "profile_id": payload.get("profile_id")
+        or config.get("quick_add_profile_id")
+        or 1,
+        "auto_download_enabled": auto_download_enabled,
+        "auto_download_interval_minutes": auto_download_interval_minutes,
+        "auto_download_start_at": None,
+        "auto_download_last_run_at": None,
+        "auto_download_next_run_at": None,
+        "auto_download_last_status": "",
+        "auto_download_last_message": "",
+        "auto_download_history": [],
+    }
+    _normalize_creator_identity_fields(item)
+    if item.get("url") and not item.get("sec_user_id"):
+        identity_expanded = _expand_creator_identity_fields(item)
+        if identity_expanded:
+            _normalize_creator_identity_fields(item)
+    existing = find_existing_creator_by_identity(item)
+    if existing:
+        return {
+            "ok": True,
+            "status": "exists",
+            "message": "账号已存在。",
+            "exists": True,
+            "creator": existing,
+        }
+    if bool(payload.get("only_check")):
+        return {
+            "ok": True,
+            "status": "not_found",
+            "message": "当前账号尚未新增。",
+            "exists": False,
+            "creator": None,
+        }
+    item["id"] = None
+    item["initial_scan_completed"] = False
+    _normalize_schedule_fields(item)
+    item["created_at"] = now_iso()
+    item["updated_at"] = item["created_at"]
+    creator = save_sqlite_creator(item)
+    return {
+        "ok": True,
+        "status": "created",
+        "message": "账号已新增。",
+        "exists": False,
+        "creator": creator,
+    }
+
+
+def list_creator_history_for_script(password: str) -> dict:
+    validate_script_access_password(password)
+    items = []
+    for creator in list_sqlite_creators():
+        items.append(
+            {
+                "id": int(creator.get("id") or 0),
+                "platform": str(creator.get("platform") or ""),
+                "name": str(creator.get("name") or ""),
+                "mark": str(creator.get("mark") or ""),
+                "url": str(creator.get("url") or ""),
+            }
+        )
+    return {
+        "ok": True,
+        "total": len(items),
+        "items": items,
+    }
 
 
 def create_creator(payload: CreatorCreate):
@@ -315,7 +460,9 @@ def _create_single_creator_via_quick_add(url: str):
         "enabled": True,
         "profile_id": max(1, int(config.get("quick_add_profile_id") or 1)),
         "auto_download_enabled": bool(config.get("quick_add_auto_download_enabled")),
-        "auto_download_interval_minutes": max(0, int(config.get("quick_add_auto_download_interval_minutes") or 0)),
+        "auto_download_interval_minutes": max(
+            0, int(config.get("quick_add_auto_download_interval_minutes") or 0)
+        ),
         "auto_download_start_at": None,
         "auto_download_last_run_at": None,
         "auto_download_next_run_at": None,
@@ -339,27 +486,33 @@ def create_creator_via_quick_add(payload: CreatorQuickAddRequest):
     for url in urls:
         try:
             creator = _create_single_creator_via_quick_add(url)
-            items.append({
-                "url": url,
-                "success": True,
-                "creator": creator,
-                "error": "",
-            })
+            items.append(
+                {
+                    "url": url,
+                    "success": True,
+                    "creator": creator,
+                    "error": "",
+                }
+            )
             created_count += 1
         except HTTPException as error:
-            items.append({
-                "url": url,
-                "success": False,
-                "creator": None,
-                "error": str(error.detail or "Request failed"),
-            })
+            items.append(
+                {
+                    "url": url,
+                    "success": False,
+                    "creator": None,
+                    "error": str(error.detail or "Request failed"),
+                }
+            )
         except Exception as error:
-            items.append({
-                "url": url,
-                "success": False,
-                "creator": None,
-                "error": str(error),
-            })
+            items.append(
+                {
+                    "url": url,
+                    "success": False,
+                    "creator": None,
+                    "error": str(error),
+                }
+            )
     return {
         "total": len(urls),
         "created_count": created_count,
@@ -408,6 +561,8 @@ def delete_creator(creator_id: int):
     task_service.clear_creator_task_records(creator_id, purge_download_history=False)
     remove_manual_creator_run(creator_id)
     delete_sqlite_creator(creator_id)
+    # 清除该账号的任务中心缓存
+    delete_task_center_cache(creator_id)
 
 
 def collect_creator_work_ids_for_purge(item: dict) -> list[str]:
@@ -453,20 +608,20 @@ def delete_creator_with_download_history(creator_id: int) -> dict:
 
     scan_cache_rows = list_sqlite_scan_cache(creator_id)
     item["_scan_cache_rows"] = scan_cache_rows
-    item["_task_rows"] = [task for task in list_sqlite_tasks() if task.get("creator_id") == creator_id]
+    item["_task_rows"] = [
+        task for task in list_sqlite_tasks() if task.get("creator_id") == creator_id
+    ]
     work_ids = collect_local_creator_work_ids_for_purge(item)
     work_id_source = "local_cache"
     item.pop("_scan_cache_rows", None)
     item.pop("_task_rows", None)
 
-    if not work_ids:
-        work_ids = collect_remote_creator_work_ids_for_purge(item)
-        work_id_source = "remote_account_scan"
-
     task_service.clear_creator_task_records(creator_id, purge_download_history=False)
     remove_manual_creator_run(creator_id)
     deleted_count = delete_downloaded_ids(work_ids) if work_ids else 0
     delete_sqlite_creator(creator_id)
+    # 清除该账号的任务中心缓存
+    delete_task_center_cache(creator_id)
     return {
         "creator_id": creator_id,
         "resolved_work_ids": len(work_ids),

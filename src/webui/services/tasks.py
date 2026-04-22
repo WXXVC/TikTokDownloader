@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import os
 import subprocess
 import sys
@@ -26,11 +27,42 @@ from ..config import (
     WORKER_ISOLATED_BATCH_PATH,
     WORKER_ISOLATED_MAIN_PATH,
 )
-from ..db import get_sqlite_task, list_sqlite_scan_cache, list_sqlite_tasks, next_sqlite_task_id, now_iso, save_sqlite_task
-from ..db import count_sqlite_tasks, delete_sqlite_scan_cache_for_creator, delete_sqlite_tasks_by_creator, list_sqlite_task_summaries, list_sqlite_task_summaries_paginated, list_sqlite_tasks_by_statuses
+from ..db import (
+    get_sqlite_task,
+    list_sqlite_scan_cache,
+    list_sqlite_tasks,
+    next_sqlite_task_id,
+    now_iso,
+    save_sqlite_task,
+)
+from ..db import (
+    count_sqlite_tasks,
+    delete_sqlite_scan_cache_for_creator,
+    delete_sqlite_tasks_by_creator,
+    list_sqlite_task_summaries,
+    list_sqlite_task_summaries_paginated,
+    list_sqlite_tasks_by_statuses,
+)
+from ..db import (
+    get_task_center_cache,
+    get_all_task_center_cache,
+    save_task_center_cache,
+    delete_task_center_cache,
+    invalidate_task_center_cache_for_creators,
+)
 from ..schemas import DownloadTaskCreate, DownloadWorksTaskCreate
-from .auto_download_throttle import is_auto_download_paused, record_auto_download_progress
-from .creators import clear_auto_download_runtime_state, collect_creator_work_ids_for_purge, get_creator, list_creators, set_creator_initial_scan_completed, update_auto_download_result
+from .auto_download_throttle import (
+    is_auto_download_paused,
+    record_auto_download_progress,
+)
+from .creators import (
+    clear_auto_download_runtime_state,
+    collect_creator_work_ids_for_purge,
+    get_creator,
+    list_creators,
+    set_creator_initial_scan_completed,
+    update_auto_download_result,
+)
 from .engine import (
     build_run_command,
     build_settings_payload,
@@ -55,7 +87,12 @@ from .risk_guard import (
     record_http_error_signal,
     record_low_quality_signal,
 )
-from .scans import build_scan_payload, find_scan_items_by_work_ids, infer_creator_folder_name, map_engine_items
+from .scans import (
+    build_scan_payload,
+    find_scan_items_by_work_ids,
+    infer_creator_folder_name,
+    map_engine_items,
+)
 
 
 PROCESS_REGISTRY: dict[int, dict] = {}
@@ -64,6 +101,8 @@ TERMINAL_TASK_STATUSES = {"success", "failed", "stopped"}
 ACTIVE_AUTO_TASK_STATUSES = {"queued", "running"}
 AUTO_TASK_PARALLELISM = 1
 AUTO_TASK_MODES = {"auto_detail_download", "auto_creator_batch_download"}
+_LAST_ACTIVE_TASK_REFRESH_AT: datetime | None = None
+_ACTIVE_TASK_REFRESH_MIN_INTERVAL_SECONDS = 1
 
 
 def has_running_task_for_creator(creator_id: int) -> bool:
@@ -78,7 +117,49 @@ def has_running_task_for_creator(creator_id: int) -> bool:
     return count_sqlite_tasks(creator_id=creator_id, status="queued") > 0
 
 
+def get_creator_download_status(creator_id: int) -> str:
+    """获取账号的下载状态：queued, scanning, downloading, idle"""
+    tasks = list_sqlite_tasks_by_statuses(
+        creator_id=creator_id,
+        statuses=("queued", "running"),
+    )
+    has_queued = False
+    has_running_scanning = False
+    has_running_downloading = False
+
+    for task in tasks:
+        task_status = task.get("status", "")
+        task_mode = task.get("mode", "")
+
+        if task_status == "queued":
+            has_queued = True
+        elif task_status == "running":
+            # auto_detail_download 模式视为扫描中
+            if task_mode == "auto_detail_download":
+                has_running_scanning = True
+            else:
+                has_running_downloading = True
+
+    # 优先级：下载中 > 扫描中 > 排队中 > 无任务
+    if has_running_downloading:
+        return "downloading"
+    if has_running_scanning:
+        return "scanning"
+    if has_queued:
+        return "queued"
+    return "idle"
+
+
 def refresh_active_task_statuses() -> None:
+    global _LAST_ACTIVE_TASK_REFRESH_AT
+    now = datetime.now()
+    if (
+        _LAST_ACTIVE_TASK_REFRESH_AT is not None
+        and (now - _LAST_ACTIVE_TASK_REFRESH_AT).total_seconds()
+        < _ACTIVE_TASK_REFRESH_MIN_INTERVAL_SECONDS
+    ):
+        return
+    _LAST_ACTIVE_TASK_REFRESH_AT = now
     for task in list_sqlite_tasks_by_statuses(
         statuses=tuple(ACTIVE_AUTO_TASK_STATUSES),
     ):
@@ -93,12 +174,15 @@ def count_running_auto_tasks() -> int:
     return sum(
         1
         for task in list_sqlite_tasks_by_statuses(statuses=("running",))
-        if _task_status(task).get("status") == "running" and task.get("mode") in AUTO_TASK_MODES
+        if _task_status(task).get("status") == "running"
+        and task.get("mode") in AUTO_TASK_MODES
     )
 
 
 def has_active_auto_task_workload(exclude_creator_id: int | None = None) -> bool:
-    for task in list_sqlite_tasks_by_statuses(statuses=tuple(ACTIVE_AUTO_TASK_STATUSES)):
+    for task in list_sqlite_tasks_by_statuses(
+        statuses=tuple(ACTIVE_AUTO_TASK_STATUSES)
+    ):
         if task.get("mode") not in AUTO_TASK_MODES:
             continue
         current = _task_status(task)
@@ -138,16 +222,17 @@ def _summarize_auto_session(task: dict) -> dict | None:
 
     downloaded_ids = read_downloaded_ids(force_refresh=True)
     pending_tasks = [
-        item for item in session_tasks
+        item
+        for item in session_tasks
         if str(item.get("status") or "") in ACTIVE_AUTO_TASK_STATUSES
     ]
     completed_tasks = [
-        item for item in session_tasks
+        item
+        for item in session_tasks
         if str(item.get("status") or "") in TERMINAL_TASK_STATUSES
     ]
     failed_tasks = [
-        item for item in completed_tasks
-        if str(item.get("status") or "") != "success"
+        item for item in completed_tasks if str(item.get("status") or "") != "success"
     ]
     all_work_ids: set[str] = set()
     downloaded_work_ids: set[str] = set()
@@ -159,7 +244,9 @@ def _summarize_auto_session(task: dict) -> dict | None:
         }
         all_work_ids.update(work_ids)
         if str(item.get("status") or "") == "success":
-            downloaded_work_ids.update(work_id for work_id in work_ids if work_id in downloaded_ids)
+            downloaded_work_ids.update(
+                work_id for work_id in work_ids if work_id in downloaded_ids
+            )
 
     return {
         "total_batches": len(session_tasks),
@@ -192,6 +279,10 @@ def _task_status(task: dict) -> dict:
         task["updated_at"] = now_iso()
         save_sqlite_task(task)
         _finalize_registry_entry(task["id"])
+        # 任务完成时清除该账号的缓存
+        creator_id = int(task.get("creator_id") or 0)
+        if creator_id:
+            delete_task_center_cache(creator_id)
     return task
 
 
@@ -229,16 +320,15 @@ def list_task_center_summary_page(
     page: int = 1,
     page_size: int = 10,
     keyword: str = "",
-    status: str = "",
-    mode: str = "",
-    kind: str = "",
+    platform: str = "",
 ):
+    """统计中心：按账号汇总下载数据统计"""
     refresh_active_task_statuses()
     page = max(1, int(page or 1))
     page_size = max(1, min(200, int(page_size or 10)))
-    creators = list_creators()
-    tasks = list_sqlite_tasks()
-    downloaded_ids = read_downloaded_ids(force_refresh=True)
+
+    keyword_text = str(keyword or "").strip().lower()
+    platform_text = str(platform or "").strip().lower()
 
     def classify_work_type(value: str) -> str:
         text = str(value or "").strip().lower()
@@ -248,122 +338,168 @@ def list_task_center_summary_page(
             return "collection"
         return "video"
 
-    work_type_by_creator: dict[int, dict[str, str]] = {}
-    for creator in creators:
-        creator_id = int(creator["id"])
+    def compute_work_ids_hash(work_ids: set[str]) -> str:
+        """计算 work_ids 的哈希值用于检测变化"""
+        if not work_ids:
+            return ""
+        sorted_ids = sorted(work_ids)
+        return hashlib.md5(",".join(sorted_ids).encode()).hexdigest()
+
+    def classify_work_counts(
+        creator_id: int, downloaded_work_ids: set[str]
+    ) -> tuple[int, int, int]:
+        """分类统计作品数量（视频、图集、实况）"""
+        if not downloaded_work_ids:
+            return 0, 0, 0
         work_type_map: dict[str, str] = {}
         for row in list_sqlite_scan_cache(creator_id):
-            for item in row.get("payload") or []:
-                work_id = str(item.get("id") or "").strip()
-                if not work_id:
+            for scan_item in row.get("payload") or []:
+                work_id = str(scan_item.get("id") or "").strip()
+                if not work_id or work_id not in downloaded_work_ids:
                     continue
-                work_type_map[work_id] = classify_work_type(item.get("type") or "")
-        work_type_by_creator[creator_id] = work_type_map
-
-    summaries: dict[int, dict] = {
-        int(creator["id"]): {
-            "creator_id": int(creator["id"]),
-            "creator_name": creator.get("name") or "",
-            "platform": creator.get("platform") or "",
-            "mark": creator.get("mark") or "",
-            "video_ids": set(),
-            "collection_ids": set(),
-            "live_ids": set(),
-            "failed_count": 0,
-            "last_download_at": None,
-        }
-        for creator in creators
-    }
-
-    status_text = str(status or "").strip().lower()
-    mode_text = str(mode or "").strip()
-    kind_text = str(kind or "").strip().lower()
-
-    for task in tasks:
-        creator_id = int(task.get("creator_id") or 0)
-        if not creator_id:
-            continue
-        task_status = str(task.get("status") or "").strip().lower()
-        task_mode = str(task.get("mode") or "").strip()
-        is_auto_task = task_mode in AUTO_TASK_MODES
-        if status_text and task_status != status_text:
-            continue
-        if mode_text and task_mode != mode_text:
-            continue
-        if kind_text == "auto" and not is_auto_task:
-            continue
-        if kind_text == "manual" and is_auto_task:
-            continue
-        summary = summaries.setdefault(
-            creator_id,
-            {
-                "creator_id": creator_id,
-                "creator_name": task.get("creator_name") or f"账号 {creator_id}",
-                "platform": task.get("platform") or "",
-                "mark": "",
-                "video_ids": set(),
-                "collection_ids": set(),
-                "live_ids": set(),
-                "failed_count": 0,
-                "last_download_at": None,
-            },
-        )
-
-        if task.get("status") == "failed":
-            summary["failed_count"] += 1
-
-        work_ids = [str(item) for item in (task.get("work_ids") or []) if item]
-        if not work_ids:
-            continue
-
-        success_work_ids = [work_id for work_id in work_ids if work_id in downloaded_ids]
-        if not success_work_ids:
-            continue
-
-        updated_at = task.get("updated_at") or task.get("created_at")
-        work_type_map = work_type_by_creator.setdefault(creator_id, {})
-        matched_items = find_scan_items_by_work_ids(creator_id, success_work_ids)
-        for item in matched_items:
-            if item.get("id"):
-                work_type_map[str(item["id"])] = classify_work_type(item.get("type") or "")
-        for work_id in success_work_ids:
+                work_type_map[work_id] = classify_work_type(scan_item.get("type") or "")
+        video_count = 0
+        collection_count = 0
+        live_count = 0
+        for work_id in downloaded_work_ids:
             item_type = classify_work_type(work_type_map.get(work_id, ""))
             if item_type == "collection":
-                summary["collection_ids"].add(work_id)
+                collection_count += 1
             elif item_type == "live":
-                summary["live_ids"].add(work_id)
+                live_count += 1
             else:
-                summary["video_ids"].add(work_id)
-        if updated_at and (summary["last_download_at"] is None or str(updated_at) > str(summary["last_download_at"])):
-            summary["last_download_at"] = updated_at
+                video_count += 1
+        return video_count, collection_count, live_count
 
+    def compute_creator_stats(
+        creator_id: int, tasks: list[dict], downloaded_ids: set[str]
+    ) -> dict:
+        """计算单个账号的统计数据"""
+        downloaded_work_ids: set[str] = set()
+        failed_count = 0
+        last_download_at = None
+
+        for task in tasks:
+            if int(task.get("creator_id") or 0) != creator_id:
+                continue
+            if task.get("status") == "failed":
+                failed_count += 1
+            work_ids = [str(item) for item in (task.get("work_ids") or []) if item]
+            if not work_ids:
+                continue
+            success_work_ids = [
+                work_id for work_id in work_ids if work_id in downloaded_ids
+            ]
+            if success_work_ids:
+                downloaded_work_ids.update(success_work_ids)
+                updated_at = task.get("updated_at") or task.get("created_at")
+                if updated_at and (
+                    last_download_at is None or str(updated_at) > str(last_download_at)
+                ):
+                    last_download_at = updated_at
+
+        video_count, collection_count, live_count = classify_work_counts(
+            creator_id, downloaded_work_ids
+        )
+        work_ids_hash = compute_work_ids_hash(downloaded_work_ids)
+
+        return {
+            "video_count": video_count,
+            "collection_count": collection_count,
+            "live_count": live_count,
+            "failed_count": failed_count,
+            "last_download_at": last_download_at,
+            "downloaded_work_ids_hash": work_ids_hash,
+        }
+
+    # 获取所有账号
+    creators = list_creators()
+    creator_map = {int(c["id"]): c for c in creators}
+
+    # 获取所有缓存
+    cache_entries = get_all_task_center_cache()
+    cache_map = {e["creator_id"]: e for e in cache_entries}
+
+    # 收集需要刷新缓存的账号
+    need_refresh_creator_ids = set()
+    for creator_id in creator_map:
+        if creator_id not in cache_map:
+            need_refresh_creator_ids.add(creator_id)
+
+    # 清理已删除账号的缓存
+    for cached_creator_id in cache_map:
+        if cached_creator_id not in creator_map:
+            delete_task_center_cache(cached_creator_id)
+
+    # 如果有账号需要刷新缓存
+    if need_refresh_creator_ids:
+        downloaded_ids = read_downloaded_ids(force_refresh=True)
+        tasks = list_sqlite_tasks()
+
+        for creator_id in need_refresh_creator_ids:
+            stats = compute_creator_stats(creator_id, tasks, downloaded_ids)
+            save_task_center_cache(
+                creator_id=creator_id,
+                video_count=stats["video_count"],
+                collection_count=stats["collection_count"],
+                live_count=stats["live_count"],
+                failed_count=stats["failed_count"],
+                last_download_at=stats["last_download_at"],
+                downloaded_work_ids_hash=stats["downloaded_work_ids_hash"],
+            )
+            # 更新 cache_map
+            cache_map[creator_id] = {
+                "creator_id": creator_id,
+                **stats,
+                "updated_at": now_iso(),
+            }
+
+    # 构建结果列表（从缓存读取）
     items = []
-    keyword_text = str(keyword or "").strip().lower()
-    for summary in summaries.values():
-        creator_name = summary["creator_name"]
-        mark = summary["mark"]
-        if keyword_text and keyword_text not in f"{creator_name} {mark} {summary['platform']}".lower():
+    for creator_id, creator in creator_map.items():
+        cache = cache_map.get(creator_id)
+        if not cache:
             continue
+
+        # 平台筛选
+        creator_platform = str(creator.get("platform") or "").strip().lower()
+        if platform_text and creator_platform != platform_text:
+            continue
+
+        # 关键字筛选
+        creator_name = creator.get("name") or ""
+        mark = creator.get("mark") or ""
+        if (
+            keyword_text
+            and keyword_text not in f"{creator_name} {mark} {creator_platform}".lower()
+        ):
+            continue
+
         items.append(
             {
-                "creator_id": summary["creator_id"],
+                "creator_id": creator_id,
                 "creator_name": creator_name,
-                "platform": summary["platform"],
+                "platform": creator.get("platform") or "",
                 "mark": mark,
-                "video_count": len(summary["video_ids"]),
-                "collection_count": len(summary["collection_ids"]),
-                "live_count": len(summary["live_ids"]),
-                "failed_count": int(summary["failed_count"] or 0),
-                "last_download_at": summary["last_download_at"],
+                "video_count": cache["video_count"],
+                "collection_count": cache["collection_count"],
+                "live_count": cache["live_count"],
+                "failed_count": cache["failed_count"],
+                "last_download_at": cache["last_download_at"],
             }
         )
 
-    items.sort(key=lambda item: ((item["last_download_at"] or ""), item["creator_id"]), reverse=True)
+    # 排序和分页
+    items.sort(
+        key=lambda x: ((x.get("last_download_at") or ""), x["creator_id"]), reverse=True
+    )
     total = len(items)
     start = (page - 1) * page_size
     end = start + page_size
+    paged_items = items[start:end]
+
     return {
-        "items": items[start:end],
+        "items": paged_items,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -383,20 +519,26 @@ def list_running_task_cards() -> list[dict]:
     downloaded_ids = read_downloaded_ids(force_refresh=True)
     items: list[dict] = []
     auto_groups: dict[tuple[int, str], dict] = {}
-    for task in list_sqlite_tasks_by_statuses(statuses=("queued", "running"), order_asc=False):
+    for task in list_sqlite_tasks_by_statuses(
+        statuses=("queued", "running"), order_asc=False
+    ):
         current = _task_status(task)
         status = str(current.get("status") or "")
         if status not in {"queued", "running"}:
             continue
         if current.get("mode") in AUTO_TASK_MODES:
-            session_id = str(current.get("auto_session_id") or "").strip() or f"creator:{current.get('creator_id')}"
+            session_id = (
+                str(current.get("auto_session_id") or "").strip()
+                or f"creator:{current.get('creator_id')}"
+            )
             group_key = (int(current.get("creator_id") or 0), session_id)
             group = auto_groups.setdefault(
                 group_key,
                 {
                     "task_id": int(current["id"]),
                     "creator_id": int(current["creator_id"]),
-                    "creator_name": current.get("creator_name") or f"璐﹀彿 {current['creator_id']}",
+                    "creator_name": current.get("creator_name")
+                    or f"璐﹀彿 {current['creator_id']}",
                     "platform": current.get("platform") or "",
                     "mode": current.get("mode") or "",
                     "work_ids": set(),
@@ -406,25 +548,36 @@ def list_running_task_cards() -> list[dict]:
             )
             group["task_id"] = max(int(group["task_id"]), int(current["id"]))
             group["work_ids"].update(
-                str(work_id) for work_id in (current.get("work_ids") or []) if str(work_id or "").strip()
+                str(work_id)
+                for work_id in (current.get("work_ids") or [])
+                if str(work_id or "").strip()
             )
             if status == "running":
                 group["message"] = current.get("message") or group["message"]
-                group["target_folder_name"] = current.get("target_folder_name") or group["target_folder_name"]
+                group["target_folder_name"] = (
+                    current.get("target_folder_name") or group["target_folder_name"]
+                )
             continue
         work_ids = [str(item) for item in (current.get("work_ids") or []) if item]
         total_count = max(0, int(current.get("item_count") or 0))
         if work_ids:
             total_count = max(total_count, len(work_ids))
-            completed_count = sum(1 for work_id in work_ids if work_id in downloaded_ids)
+            completed_count = sum(
+                1 for work_id in work_ids if work_id in downloaded_ids
+            )
         else:
             completed_count = 0
-        progress_percent = min(100, int((completed_count / total_count) * 100)) if total_count > 0 else 0
+        progress_percent = (
+            min(100, int((completed_count / total_count) * 100))
+            if total_count > 0
+            else 0
+        )
         items.append(
             {
                 "task_id": int(current["id"]),
                 "creator_id": int(current["creator_id"]),
-                "creator_name": current.get("creator_name") or f"账号 {current['creator_id']}",
+                "creator_name": current.get("creator_name")
+                or f"账号 {current['creator_id']}",
                 "platform": current.get("platform") or "",
                 "mode": current.get("mode") or "",
                 "total_count": total_count,
@@ -438,7 +591,11 @@ def list_running_task_cards() -> list[dict]:
         work_ids = list(group["work_ids"])
         total_count = len(work_ids)
         completed_count = sum(1 for work_id in work_ids if work_id in downloaded_ids)
-        progress_percent = min(100, int((completed_count / total_count) * 100)) if total_count > 0 else 0
+        progress_percent = (
+            min(100, int((completed_count / total_count) * 100))
+            if total_count > 0
+            else 0
+        )
         items.append(
             {
                 "task_id": int(group["task_id"]),
@@ -514,13 +671,19 @@ def _record_completed_auto_download_progress(task: dict) -> None:
         works_count=success_count,
     )
     if throttle_state.get("last_reason"):
-        task["message"] = f"{task.get('message') or 'Downloader process finished successfully'} {throttle_state['last_reason']}".strip()
+        task["message"] = (
+            f"{task.get('message') or 'Downloader process finished successfully'} {throttle_state['last_reason']}".strip()
+        )
 
 
 def _mark_creator_initial_scan_completed_for_task(task: dict) -> None:
     if task.get("status") != "success":
         return
-    if task.get("mode") not in {"creator_batch_download", "auto_creator_batch_download", "auto_detail_download"}:
+    if task.get("mode") not in {
+        "creator_batch_download",
+        "auto_creator_batch_download",
+        "auto_detail_download",
+    }:
         return
     creator_id = int(task.get("creator_id") or 0)
     if creator_id <= 0:
@@ -682,8 +845,11 @@ def _sync_creator_auto_download_status(task: dict) -> None:
     update_auto_download_result(
         creator_id,
         status="failed",
-        message=task.get("message") or (
-            "自动整号下载任务失败" if task.get("mode") == "auto_creator_batch_download" else "自动下载任务失败"
+        message=task.get("message")
+        or (
+            "自动整号下载任务失败"
+            if task.get("mode") == "auto_creator_batch_download"
+            else "自动下载任务失败"
         ),
         next_run_at=next_run_at,
         mark_run=False,
@@ -727,7 +893,9 @@ def _prepare_runtime_engine_db(target_volume: Path) -> None:
             )
             conn.execute("REPLACE INTO config_data (NAME, VALUE) VALUES ('Record', 1)")
             conn.execute("REPLACE INTO config_data (NAME, VALUE) VALUES ('Logger', 1)")
-            conn.execute("REPLACE INTO config_data (NAME, VALUE) VALUES ('Disclaimer', 1)")
+            conn.execute(
+                "REPLACE INTO config_data (NAME, VALUE) VALUES ('Disclaimer', 1)"
+            )
             conn.commit()
     except sqlite3.Error:
         # Shared engine databases can be readonly in some deployments.
@@ -797,15 +965,24 @@ def _launch_creator_batch_task(
     settings["run_command"] = build_run_command(creator["platform"])
     volume_path = _prepare_task_volume(task_id, settings)
     if not WORKER_ISOLATED_MAIN_PATH.exists():
-        raise HTTPException(status_code=500, detail="Isolated main worker script not found")
+        raise HTTPException(
+            status_code=500, detail="Isolated main worker script not found"
+        )
     process_env = os.environ.copy()
     process_env["PYTHONUNBUFFERED"] = "1"
     process_env["DOUK_FILE_DOWNLOAD_MAX_WORKERS"] = str(get_file_download_max_workers())
-    process, stdout_log, stderr_log, stdout_handle, stderr_handle = _start_process_with_logs(
-        task_id,
-        [sys.executable, str(WORKER_ISOLATED_MAIN_PATH), "--volume", str(volume_path)],
-        str(ENGINE_PROJECT_ROOT),
-        env=process_env,
+    process, stdout_log, stderr_log, stdout_handle, stderr_handle = (
+        _start_process_with_logs(
+            task_id,
+            [
+                sys.executable,
+                str(WORKER_ISOLATED_MAIN_PATH),
+                "--volume",
+                str(volume_path),
+            ],
+            str(ENGINE_PROJECT_ROOT),
+            env=process_env,
+        )
     )
     task = {
         "id": task_id,
@@ -834,7 +1011,9 @@ def _launch_creator_batch_task(
     return task
 
 
-def _launch_detail_task(task_id: int, creator: dict, profile: dict, work_ids: list[str], mode: str) -> dict:
+def _launch_detail_task(
+    task_id: int, creator: dict, profile: dict, work_ids: list[str], mode: str
+) -> dict:
     settings = read_engine_settings()
     settings.update(build_settings_payload(profile, [creator]))
     settings["root"] = _resolve_download_root(profile, settings)
@@ -844,7 +1023,9 @@ def _launch_detail_task(task_id: int, creator: dict, profile: dict, work_ids: li
         settings["folder_name"] = target_folder_name
     volume_path = _prepare_task_volume(task_id, settings)
     if not WORKER_ISOLATED_DETAIL_PATH.exists():
-        raise HTTPException(status_code=500, detail="Isolated detail worker script not found")
+        raise HTTPException(
+            status_code=500, detail="Isolated detail worker script not found"
+        )
     command = [
         sys.executable,
         str(WORKER_ISOLATED_DETAIL_PATH),
@@ -859,11 +1040,13 @@ def _launch_detail_task(task_id: int, creator: dict, profile: dict, work_ids: li
     process_env["PYTHONUNBUFFERED"] = "1"
     process_env["DOUK_DETAIL_FETCH_CONCURRENCY"] = str(get_detail_fetch_concurrency())
     process_env["DOUK_FILE_DOWNLOAD_MAX_WORKERS"] = str(get_file_download_max_workers())
-    process, stdout_log, stderr_log, stdout_handle, stderr_handle = _start_process_with_logs(
-        task_id,
-        command,
-        str(ENGINE_PROJECT_ROOT),
-        env=process_env,
+    process, stdout_log, stderr_log, stdout_handle, stderr_handle = (
+        _start_process_with_logs(
+            task_id,
+            command,
+            str(ENGINE_PROJECT_ROOT),
+            env=process_env,
+        )
     )
     task = {
         "id": task_id,
@@ -876,7 +1059,9 @@ def _launch_detail_task(task_id: int, creator: dict, profile: dict, work_ids: li
         "item_count": len(work_ids),
         "run_command": "detail-worker " + " ".join(work_ids),
         "pid": process.pid,
-        "message": "Auto detail download worker started" if mode == "auto_detail_download" else "Detail download worker started",
+        "message": "Auto detail download worker started"
+        if mode == "auto_detail_download"
+        else "Detail download worker started",
         "stdout_log": stdout_log,
         "stderr_log": stderr_log,
         "exit_code": None,
@@ -908,7 +1093,9 @@ def _launch_batch_source_task(
     settings["folder_name"] = target_folder_name
     volume_path = _prepare_task_volume(task_id, settings)
     if not WORKER_ISOLATED_BATCH_PATH.exists():
-        raise HTTPException(status_code=500, detail="Isolated batch worker script not found")
+        raise HTTPException(
+            status_code=500, detail="Isolated batch worker script not found"
+        )
     source_path = volume_path / "webui_batch_source.json"
     source_path.write_text(
         json.dumps(source_items, ensure_ascii=False, indent=2),
@@ -933,11 +1120,13 @@ def _launch_batch_source_task(
     process_env = os.environ.copy()
     process_env["PYTHONUNBUFFERED"] = "1"
     process_env["DOUK_FILE_DOWNLOAD_MAX_WORKERS"] = str(get_file_download_max_workers())
-    process, stdout_log, stderr_log, stdout_handle, stderr_handle = _start_process_with_logs(
-        task_id,
-        command,
-        str(ENGINE_PROJECT_ROOT),
-        env=process_env,
+    process, stdout_log, stderr_log, stdout_handle, stderr_handle = (
+        _start_process_with_logs(
+            task_id,
+            command,
+            str(ENGINE_PROJECT_ROOT),
+            env=process_env,
+        )
     )
     task = {
         "id": task_id,
@@ -967,7 +1156,9 @@ def _launch_batch_source_task(
     return task
 
 
-def _build_queued_auto_task(task_id: int, creator: dict, profile: dict, work_ids: list[str], created_at: str) -> dict:
+def _build_queued_auto_task(
+    task_id: int, creator: dict, profile: dict, work_ids: list[str], created_at: str
+) -> dict:
     return _build_queued_auto_task_with_mode(
         task_id,
         creator,
@@ -1035,14 +1226,18 @@ def create_works_download_task(payload: DownloadWorksTaskCreate):
     creator = get_creator(payload.creator_id)
     profile = get_profile(creator.get("profile_id") or 1)
     record_low_quality_signal(
-        assess_low_quality_items(find_scan_items_by_work_ids(payload.creator_id, payload.work_ids))
+        assess_low_quality_items(
+            find_scan_items_by_work_ids(payload.creator_id, payload.work_ids)
+        )
     )
     if is_risk_guard_active():
         raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
     created_at = now_iso()
     task_id = next_sqlite_task_id()
     with TASK_LAUNCH_LOCK:
-        task = _launch_detail_task(task_id, creator, profile, payload.work_ids, "detail_download")
+        task = _launch_detail_task(
+            task_id, creator, profile, payload.work_ids, "detail_download"
+        )
     task["created_at"] = created_at
     task["updated_at"] = created_at
     _append_task(task)
@@ -1056,24 +1251,32 @@ def create_auto_works_download_task(
     allow_when_scheduler_disabled: bool = False,
 ):
     if not allow_when_scheduler_disabled and not is_auto_download_scheduler_enabled():
-        raise HTTPException(status_code=409, detail="Auto download scheduler is disabled")
+        raise HTTPException(
+            status_code=409, detail="Auto download scheduler is disabled"
+        )
     if is_risk_guard_active():
         raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
     creator = get_creator(payload.creator_id)
     profile = get_profile(creator.get("profile_id") or 1)
     record_low_quality_signal(
-        assess_low_quality_items(find_scan_items_by_work_ids(payload.creator_id, payload.work_ids))
+        assess_low_quality_items(
+            find_scan_items_by_work_ids(payload.creator_id, payload.work_ids)
+        )
     )
     if is_risk_guard_active():
         raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
     created_at = now_iso()
     task_id = next_sqlite_task_id()
     if count_running_auto_tasks() >= AUTO_TASK_PARALLELISM:
-        task = _build_queued_auto_task(task_id, creator, profile, payload.work_ids, created_at)
+        task = _build_queued_auto_task(
+            task_id, creator, profile, payload.work_ids, created_at
+        )
         task["auto_session_id"] = session_id
         return save_sqlite_task(task)
     with TASK_LAUNCH_LOCK:
-        task = _launch_detail_task(task_id, creator, profile, payload.work_ids, "auto_detail_download")
+        task = _launch_detail_task(
+            task_id, creator, profile, payload.work_ids, "auto_detail_download"
+        )
     task["auto_session_id"] = session_id
     task["created_at"] = created_at
     task["updated_at"] = created_at
@@ -1087,13 +1290,17 @@ def create_auto_creator_batch_task(
     allow_when_scheduler_disabled: bool = False,
 ):
     if not allow_when_scheduler_disabled and not is_auto_download_scheduler_enabled():
-        raise HTTPException(status_code=409, detail="Auto download scheduler is disabled")
+        raise HTTPException(
+            status_code=409, detail="Auto download scheduler is disabled"
+        )
     if is_risk_guard_active():
         raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
     creator = get_creator(payload.creator_id)
     profile = get_profile(creator.get("profile_id") or 1)
     record_low_quality_signal(
-        assess_low_quality_items(find_scan_items_by_work_ids(payload.creator_id, payload.work_ids))
+        assess_low_quality_items(
+            find_scan_items_by_work_ids(payload.creator_id, payload.work_ids)
+        )
     )
     if is_risk_guard_active():
         raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
@@ -1133,7 +1340,9 @@ def create_auto_batch_source_task(
     allow_when_scheduler_disabled: bool = False,
 ):
     if not allow_when_scheduler_disabled and not is_auto_download_scheduler_enabled():
-        raise HTTPException(status_code=409, detail="Auto download scheduler is disabled")
+        raise HTTPException(
+            status_code=409, detail="Auto download scheduler is disabled"
+        )
     if is_risk_guard_active():
         raise HTTPException(status_code=409, detail="Risk guard cooldown is active")
     creator = get_creator(creator_id)
@@ -1227,7 +1436,9 @@ async def task_dispatcher_loop(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         await asyncio.to_thread(dispatch_queued_auto_tasks)
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=TASK_DISPATCH_INTERVAL_SECONDS)
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=TASK_DISPATCH_INTERVAL_SECONDS
+            )
         except asyncio.TimeoutError:
             pass
 
@@ -1271,7 +1482,9 @@ async def task_runtime_cleanup_loop(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         await asyncio.to_thread(cleanup_task_runtime_dirs)
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=TASK_RUNTIME_CLEANUP_INTERVAL_SECONDS)
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=TASK_RUNTIME_CLEANUP_INTERVAL_SECONDS
+            )
         except asyncio.TimeoutError:
             pass
 
@@ -1279,11 +1492,15 @@ async def task_runtime_cleanup_loop(stop_event: asyncio.Event) -> None:
 def stop_task(task_id: int):
     task = get_sqlite_task(task_id)
     if task:
+        creator_id = int(task.get("creator_id") or 0)
         if task.get("status") == "queued":
             task["status"] = "stopped"
             task["message"] = "Queued auto task cancelled by user"
             task["updated_at"] = now_iso()
             save_sqlite_task(task)
+            # 清除该账号的缓存
+            if creator_id:
+                delete_task_center_cache(creator_id)
             return task
         entry = PROCESS_REGISTRY.get(task_id)
         process = entry["process"] if entry else None
@@ -1301,13 +1518,18 @@ def stop_task(task_id: int):
         task["updated_at"] = now_iso()
         save_sqlite_task(task)
         _finalize_registry_entry(task_id)
+        # 清除该账号的缓存
+        if creator_id:
+            delete_task_center_cache(creator_id)
         return task
     raise HTTPException(status_code=404, detail="Task not found")
 
 
 def stop_creator_workflow(creator_id: int) -> dict:
     creator = get_creator(creator_id)
-    from .auto_download_runtime import request_stop_creator_workflow as request_stop_workflow
+    from .auto_download_runtime import (
+        request_stop_creator_workflow as request_stop_workflow,
+    )
 
     stop_request = request_stop_workflow(creator_id)
     stopped_task_count = 0
@@ -1345,7 +1567,9 @@ def stop_creator_workflow(creator_id: int) -> dict:
     }
 
 
-def clear_creator_task_records(creator_id: int, purge_download_history: bool = False) -> dict:
+def clear_creator_task_records(
+    creator_id: int, purge_download_history: bool = False
+) -> dict:
     creator = get_creator(creator_id)
     affected_tasks = list_sqlite_tasks_by_statuses(creator_id=creator_id)
     scan_cache_rows = list_sqlite_scan_cache(creator_id)

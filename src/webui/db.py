@@ -120,7 +120,9 @@ def ensure_database() -> None:
             for key, value in CREATOR_DEFAULTS.items():
                 if key not in creator:
                     if key == "initial_scan_completed":
-                        creator[key] = int(creator.get("id") or 0) in scan_cache_creator_ids
+                        creator[key] = (
+                            int(creator.get("id") or 0) in scan_cache_creator_ids
+                        )
                     else:
                         creator[key] = deepcopy(value)
                     changed = True
@@ -296,6 +298,16 @@ def _bootstrap_sqlite(seed_store: dict) -> None:
                 total_count INTEGER NOT NULL,
                 undownloaded_count INTEGER NOT NULL,
                 payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_center_cache (
+                creator_id INTEGER PRIMARY KEY,
+                video_count INTEGER NOT NULL DEFAULT 0,
+                collection_count INTEGER NOT NULL DEFAULT 0,
+                live_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                last_download_at TEXT,
+                downloaded_work_ids_hash TEXT,
+                updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_creators_auto_schedule
             ON creators (enabled, auto_download_enabled, auto_download_next_run_at, id);
@@ -476,7 +488,9 @@ def list_sqlite_creator_summaries() -> list[dict]:
             "enabled": bool(row["enabled"]),
             "profile_id": row["profile_id"],
             "auto_download_enabled": bool(row["auto_download_enabled"]),
-            "auto_download_interval_minutes": int(row["auto_download_interval_minutes"] or 0),
+            "auto_download_interval_minutes": int(
+                row["auto_download_interval_minutes"] or 0
+            ),
             "auto_download_start_at": row["auto_download_start_at"],
             "auto_download_last_run_at": row["auto_download_last_run_at"],
             "auto_download_next_run_at": row["auto_download_next_run_at"],
@@ -498,7 +512,8 @@ def list_sqlite_creator_summaries_paginated(
     profile_id: int | None = None,
     enabled: str = "",
     auto_enabled: str = "",
-    auto_status: str = "",
+    download_status: str = "",
+    get_creator_download_status=None,
 ) -> dict:
     ensure_database()
     page = max(1, int(page or 1))
@@ -535,73 +550,115 @@ def list_sqlite_creator_summaries_paginated(
         clauses.append("auto_download_enabled = ?")
         params.append(1 if auto_enabled == "true" else 0)
 
-    if auto_status == "failed":
-        clauses.append("COALESCE(json_extract(data, '$.auto_download_last_status'), '') = 'failed'")
-    elif auto_status == "success":
-        clauses.append("COALESCE(json_extract(data, '$.auto_download_last_status'), '') = 'success'")
-    elif auto_status == "empty":
-        clauses.append("COALESCE(json_extract(data, '$.auto_download_last_status'), '') = ''")
-
     where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     offset = (page - 1) * page_size
     with _connect_sqlite() as conn:
-        total_row = conn.execute(
-            f"SELECT COUNT(1) AS count FROM creators {where_clause}",
-            tuple(params),
-        ).fetchone()
-        rows = conn.execute(
-            f"""
-            SELECT
-                id,
-                json_extract(data, '$.platform') AS platform,
-                json_extract(data, '$.name') AS name,
-                COALESCE(json_extract(data, '$.mark'), '') AS mark,
-                json_extract(data, '$.url') AS url,
-                COALESCE(json_extract(data, '$.sec_user_id'), '') AS sec_user_id,
-                COALESCE(json_extract(data, '$.tab'), 'post') AS tab,
-                enabled,
-                profile_id,
-                auto_download_enabled,
-                COALESCE(json_extract(data, '$.auto_download_interval_minutes'), 0) AS auto_download_interval_minutes,
-                json_extract(data, '$.auto_download_start_at') AS auto_download_start_at,
-                json_extract(data, '$.auto_download_last_run_at') AS auto_download_last_run_at,
-                auto_download_next_run_at,
-                COALESCE(json_extract(data, '$.auto_download_last_status'), '') AS auto_download_last_status,
-                COALESCE(json_extract(data, '$.auto_download_last_message'), '') AS auto_download_last_message,
-                json_extract(data, '$.created_at') AS created_at,
-                updated_at
-            FROM creators
-            {where_clause}
-            ORDER BY id DESC
-            LIMIT ? OFFSET ?
-            """,
-            (*params, page_size, offset),
-        ).fetchall()
+        if download_status and get_creator_download_status:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id,
+                    json_extract(data, '$.platform') AS platform,
+                    json_extract(data, '$.name') AS name,
+                    COALESCE(json_extract(data, '$.mark'), '') AS mark,
+                    json_extract(data, '$.url') AS url,
+                    COALESCE(json_extract(data, '$.sec_user_id'), '') AS sec_user_id,
+                    COALESCE(json_extract(data, '$.tab'), 'post') AS tab,
+                    enabled,
+                    profile_id,
+                    auto_download_enabled,
+                    COALESCE(json_extract(data, '$.auto_download_interval_minutes'), 0) AS auto_download_interval_minutes,
+                    json_extract(data, '$.auto_download_start_at') AS auto_download_start_at,
+                    json_extract(data, '$.auto_download_last_run_at') AS auto_download_last_run_at,
+                    auto_download_next_run_at,
+                    COALESCE(json_extract(data, '$.auto_download_last_status'), '') AS auto_download_last_status,
+                    COALESCE(json_extract(data, '$.auto_download_last_message'), '') AS auto_download_last_message,
+                    json_extract(data, '$.created_at') AS created_at,
+                    updated_at
+                FROM creators
+                {where_clause}
+                ORDER BY id DESC
+                """,
+                tuple(params),
+            ).fetchall()
+            total_row = None
+        else:
+            total_row = conn.execute(
+                f"SELECT COUNT(1) AS count FROM creators {where_clause}",
+                tuple(params),
+            ).fetchone()
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id,
+                    json_extract(data, '$.platform') AS platform,
+                    json_extract(data, '$.name') AS name,
+                    COALESCE(json_extract(data, '$.mark'), '') AS mark,
+                    json_extract(data, '$.url') AS url,
+                    COALESCE(json_extract(data, '$.sec_user_id'), '') AS sec_user_id,
+                    COALESCE(json_extract(data, '$.tab'), 'post') AS tab,
+                    enabled,
+                    profile_id,
+                    auto_download_enabled,
+                    COALESCE(json_extract(data, '$.auto_download_interval_minutes'), 0) AS auto_download_interval_minutes,
+                    json_extract(data, '$.auto_download_start_at') AS auto_download_start_at,
+                    json_extract(data, '$.auto_download_last_run_at') AS auto_download_last_run_at,
+                    auto_download_next_run_at,
+                    COALESCE(json_extract(data, '$.auto_download_last_status'), '') AS auto_download_last_status,
+                    COALESCE(json_extract(data, '$.auto_download_last_message'), '') AS auto_download_last_message,
+                    json_extract(data, '$.created_at') AS created_at,
+                    updated_at
+                FROM creators
+                {where_clause}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, page_size, offset),
+            ).fetchall()
+
+    items = [
+        {
+            "id": row["id"],
+            "platform": row["platform"] or "",
+            "name": row["name"] or "",
+            "mark": row["mark"] or "",
+            "url": row["url"] or "",
+            "sec_user_id": row["sec_user_id"] or "",
+            "tab": row["tab"] or "post",
+            "enabled": bool(row["enabled"]),
+            "profile_id": row["profile_id"],
+            "auto_download_enabled": bool(row["auto_download_enabled"]),
+            "auto_download_interval_minutes": int(
+                row["auto_download_interval_minutes"] or 0
+            ),
+            "auto_download_start_at": row["auto_download_start_at"],
+            "auto_download_last_run_at": row["auto_download_last_run_at"],
+            "auto_download_next_run_at": row["auto_download_next_run_at"],
+            "auto_download_last_status": row["auto_download_last_status"] or "",
+            "auto_download_last_message": row["auto_download_last_message"] or "",
+            "created_at": row["created_at"] or "",
+            "updated_at": row["updated_at"] or "",
+        }
+        for row in rows
+    ]
+
+    if download_status and get_creator_download_status:
+        download_status_text = str(download_status or "").strip().lower()
+        if download_status_text in {"queued", "scanning", "downloading", "idle"}:
+            items = [
+                item
+                for item in items
+                if get_creator_download_status(item["id"]) == download_status_text
+            ]
+        total = len(items)
+        paged_items = items[offset : offset + page_size]
+    else:
+        total = int(total_row["count"] or 0) if total_row else len(items)
+        paged_items = items
+
     return {
-        "items": [
-            {
-                "id": row["id"],
-                "platform": row["platform"] or "",
-                "name": row["name"] or "",
-                "mark": row["mark"] or "",
-                "url": row["url"] or "",
-                "sec_user_id": row["sec_user_id"] or "",
-                "tab": row["tab"] or "post",
-                "enabled": bool(row["enabled"]),
-                "profile_id": row["profile_id"],
-                "auto_download_enabled": bool(row["auto_download_enabled"]),
-                "auto_download_interval_minutes": int(row["auto_download_interval_minutes"] or 0),
-                "auto_download_start_at": row["auto_download_start_at"],
-                "auto_download_last_run_at": row["auto_download_last_run_at"],
-                "auto_download_next_run_at": row["auto_download_next_run_at"],
-                "auto_download_last_status": row["auto_download_last_status"] or "",
-                "auto_download_last_message": row["auto_download_last_message"] or "",
-                "created_at": row["created_at"] or "",
-                "updated_at": row["updated_at"] or "",
-            }
-            for row in rows
-        ],
-        "total": int(total_row["count"]) if total_row else 0,
+        "items": paged_items,
+        "total": total,
         "page": page,
         "page_size": page_size,
     }
@@ -670,17 +727,27 @@ def get_sqlite_dashboard_summary() -> dict:
             """
         ).fetchone()
     return {
-        "auto_enabled_count": int(creator_stats["auto_enabled_count"] or 0) if creator_stats else 0,
-        "auto_failed_count": int(creator_stats["auto_failed_count"] or 0) if creator_stats else 0,
-        "running_auto_tasks": int(task_stats["running_auto_tasks"] or 0) if task_stats else 0,
+        "auto_enabled_count": int(creator_stats["auto_enabled_count"] or 0)
+        if creator_stats
+        else 0,
+        "auto_failed_count": int(creator_stats["auto_failed_count"] or 0)
+        if creator_stats
+        else 0,
+        "running_auto_tasks": int(task_stats["running_auto_tasks"] or 0)
+        if task_stats
+        else 0,
         "next_creator": (
             {
                 "id": next_creator_row["id"],
                 "name": next_creator_row["name"] or "",
                 "mark": next_creator_row["mark"] or "",
-                "auto_download_next_run_at": next_creator_row["auto_download_next_run_at"] or "",
+                "auto_download_next_run_at": next_creator_row[
+                    "auto_download_next_run_at"
+                ]
+                or "",
             }
-            if next_creator_row else None
+            if next_creator_row
+            else None
         ),
     }
 
@@ -730,7 +797,9 @@ def list_sqlite_profiles() -> list[dict]:
 def get_sqlite_profile(profile_id: int) -> dict | None:
     ensure_database()
     with _connect_sqlite() as conn:
-        row = conn.execute("SELECT data FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        row = conn.execute(
+            "SELECT data FROM profiles WHERE id = ?", (profile_id,)
+        ).fetchone()
     return _json_row(row)
 
 
@@ -738,7 +807,9 @@ def save_sqlite_profile(item: dict) -> dict:
     ensure_database()
     with _connect_sqlite() as conn:
         if item.get("id") is None:
-            row = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM profiles").fetchone()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM profiles"
+            ).fetchone()
             item["id"] = row["next_id"]
         conn.execute(
             """
@@ -772,7 +843,9 @@ def delete_sqlite_profile(profile_id: int) -> None:
 def get_sqlite_creator(creator_id: int) -> dict | None:
     ensure_database()
     with _connect_sqlite() as conn:
-        row = conn.execute("SELECT data FROM creators WHERE id = ?", (creator_id,)).fetchone()
+        row = conn.execute(
+            "SELECT data FROM creators WHERE id = ?", (creator_id,)
+        ).fetchone()
     return _json_row(row)
 
 
@@ -780,7 +853,9 @@ def save_sqlite_creator(item: dict) -> dict:
     ensure_database()
     with _connect_sqlite() as conn:
         if item.get("id") is None:
-            row = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM creators").fetchone()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM creators"
+            ).fetchone()
             item["id"] = row["next_id"]
         conn.execute(
             """
@@ -838,7 +913,9 @@ def update_sqlite_creator_sec_user_id(creator_id: int, sec_user_id: str) -> None
 def list_sqlite_tasks() -> list[dict]:
     ensure_database()
     with _connect_sqlite() as conn:
-        rows = conn.execute("SELECT data FROM download_tasks ORDER BY id DESC").fetchall()
+        rows = conn.execute(
+            "SELECT data FROM download_tasks ORDER BY id DESC"
+        ).fetchall()
     return [json.loads(row["data"]) for row in rows]
 
 
@@ -928,9 +1005,13 @@ def list_sqlite_task_summaries_paginated(
         params.append(mode)
 
     if kind == "auto":
-        clauses.append("COALESCE(json_extract(data, '$.mode'), '') IN ('auto_detail_download', 'auto_creator_batch_download')")
+        clauses.append(
+            "COALESCE(json_extract(data, '$.mode'), '') IN ('auto_detail_download', 'auto_creator_batch_download')"
+        )
     elif kind == "manual":
-        clauses.append("COALESCE(json_extract(data, '$.mode'), '') NOT IN ('auto_detail_download', 'auto_creator_batch_download')")
+        clauses.append(
+            "COALESCE(json_extract(data, '$.mode'), '') NOT IN ('auto_detail_download', 'auto_creator_batch_download')"
+        )
 
     where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     offset = (page - 1) * page_size
@@ -993,7 +1074,9 @@ def list_sqlite_task_summaries_paginated(
     }
 
 
-def count_sqlite_tasks(*, mode: str | None = None, status: str | None = None, creator_id: int | None = None) -> int:
+def count_sqlite_tasks(
+    *, mode: str | None = None, status: str | None = None, creator_id: int | None = None
+) -> int:
     ensure_database()
     clauses = []
     params: list[object] = []
@@ -1053,7 +1136,9 @@ def list_sqlite_tasks_by_statuses(
 def get_sqlite_task(task_id: int) -> dict | None:
     ensure_database()
     with _connect_sqlite() as conn:
-        row = conn.execute("SELECT data FROM download_tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute(
+            "SELECT data FROM download_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
     return _json_row(row)
 
 
@@ -1061,7 +1146,9 @@ def save_sqlite_task(item: dict) -> dict:
     ensure_database()
     with _connect_sqlite() as conn:
         if item.get("id") is None:
-            row = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM download_tasks").fetchone()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM download_tasks"
+            ).fetchone()
             item["id"] = row["next_id"]
         conn.execute(
             """
@@ -1090,14 +1177,18 @@ def save_sqlite_task(item: dict) -> dict:
 def next_sqlite_task_id() -> int:
     ensure_database()
     with _connect_sqlite() as conn:
-        row = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM download_tasks").fetchone()
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM download_tasks"
+        ).fetchone()
     return row["next_id"]
 
 
 def delete_sqlite_tasks_by_creator(creator_id: int) -> int:
     ensure_database()
     with _connect_sqlite() as conn:
-        cursor = conn.execute("DELETE FROM download_tasks WHERE creator_id = ?", (creator_id,))
+        cursor = conn.execute(
+            "DELETE FROM download_tasks WHERE creator_id = ?", (creator_id,)
+        )
         conn.commit()
     return int(cursor.rowcount or 0)
 
@@ -1108,7 +1199,10 @@ def list_sqlite_scan_cache(creator_id: int | None = None) -> list[dict]:
         if creator_id is None:
             rows = conn.execute("SELECT * FROM scan_cache ORDER BY id DESC").fetchall()
         else:
-            rows = conn.execute("SELECT * FROM scan_cache WHERE creator_id = ? ORDER BY id DESC", (creator_id,)).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM scan_cache WHERE creator_id = ? ORDER BY id DESC",
+                (creator_id,),
+            ).fetchall()
     return [
         {
             "id": row["id"],
@@ -1127,7 +1221,9 @@ def save_sqlite_scan_cache(item: dict) -> dict:
     ensure_database()
     with _connect_sqlite() as conn:
         if item.get("id") is None:
-            row = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM scan_cache").fetchone()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM scan_cache"
+            ).fetchone()
             item["id"] = row["next_id"]
         conn.execute(
             """
@@ -1173,4 +1269,125 @@ def delete_sqlite_scan_cache_except(creator_id: int, keep_ids: set[int]) -> None
             )
         else:
             conn.execute("DELETE FROM scan_cache WHERE creator_id = ?", (creator_id,))
+        conn.commit()
+
+
+# ============ Task Center Cache Functions ============
+
+
+def get_task_center_cache(creator_id: int) -> dict | None:
+    """获取单个账号的任务中心缓存"""
+    ensure_database()
+    with _connect_sqlite() as conn:
+        row = conn.execute(
+            "SELECT * FROM task_center_cache WHERE creator_id = ?",
+            (creator_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "creator_id": row["creator_id"],
+        "video_count": row["video_count"],
+        "collection_count": row["collection_count"],
+        "live_count": row["live_count"],
+        "failed_count": row["failed_count"],
+        "last_download_at": row["last_download_at"],
+        "downloaded_work_ids_hash": row["downloaded_work_ids_hash"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_all_task_center_cache() -> list[dict]:
+    """获取所有账号的任务中心缓存"""
+    ensure_database()
+    with _connect_sqlite() as conn:
+        rows = conn.execute("SELECT * FROM task_center_cache").fetchall()
+    return [
+        {
+            "creator_id": row["creator_id"],
+            "video_count": row["video_count"],
+            "collection_count": row["collection_count"],
+            "live_count": row["live_count"],
+            "failed_count": row["failed_count"],
+            "last_download_at": row["last_download_at"],
+            "downloaded_work_ids_hash": row["downloaded_work_ids_hash"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+def save_task_center_cache(
+    creator_id: int,
+    video_count: int,
+    collection_count: int,
+    live_count: int,
+    failed_count: int,
+    last_download_at: str | None,
+    downloaded_work_ids_hash: str,
+) -> None:
+    """保存单个账号的任务中心缓存"""
+    ensure_database()
+    with _connect_sqlite() as conn:
+        conn.execute(
+            """
+            INSERT INTO task_center_cache (
+                creator_id, video_count, collection_count, live_count,
+                failed_count, last_download_at, downloaded_work_ids_hash, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(creator_id) DO UPDATE SET
+                video_count = excluded.video_count,
+                collection_count = excluded.collection_count,
+                live_count = excluded.live_count,
+                failed_count = excluded.failed_count,
+                last_download_at = excluded.last_download_at,
+                downloaded_work_ids_hash = excluded.downloaded_work_ids_hash,
+                updated_at = excluded.updated_at
+            """,
+            (
+                creator_id,
+                video_count,
+                collection_count,
+                live_count,
+                failed_count,
+                last_download_at,
+                downloaded_work_ids_hash,
+                now_iso(),
+            ),
+        )
+        conn.commit()
+
+
+def delete_task_center_cache(creator_id: int) -> None:
+    """删除单个账号的任务中心缓存"""
+    ensure_database()
+    with _connect_sqlite() as conn:
+        conn.execute(
+            "DELETE FROM task_center_cache WHERE creator_id = ?", (creator_id,)
+        )
+        conn.commit()
+
+
+def invalidate_all_task_center_cache() -> None:
+    """清除所有任务中心缓存"""
+    ensure_database()
+    with _connect_sqlite() as conn:
+        conn.execute("DELETE FROM task_center_cache")
+        conn.commit()
+
+
+def invalidate_task_center_cache_for_creators(
+    creator_ids: list[int] | set[int],
+) -> None:
+    """批量清除指定账号的任务中心缓存"""
+    if not creator_ids:
+        return
+    ensure_database()
+    with _connect_sqlite() as conn:
+        placeholders = ",".join("?" for _ in creator_ids)
+        conn.execute(
+            f"DELETE FROM task_center_cache WHERE creator_id IN ({placeholders})",
+            tuple(creator_ids),
+        )
         conn.commit()

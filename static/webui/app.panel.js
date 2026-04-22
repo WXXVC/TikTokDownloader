@@ -15,6 +15,7 @@ const POLL_INTERVAL_MS = 5000;
 const POLL_BACKOFF_MS = 20000;
 const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 const ACCESS_STORAGE_KEY = "newweb-access-granted";
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "newweb-sidebar-collapsed";
 const PROFILE_NAME_FORMAT_MODULES = [
   { key: "create_time", label: "发布时间", description: "作品发布时间" },
   { key: "type", label: "作品类型", description: "视频 / 图集等" },
@@ -87,7 +88,7 @@ const state = {
     profileId: "",
     enabled: "",
     autoEnabled: "",
-    autoStatus: "",
+    downloadStatus: "",
   },
   profileFilters: {
     keyword: "",
@@ -95,9 +96,7 @@ const state = {
   },
   taskFilters: {
     keyword: "",
-    status: "",
-    mode: "",
-    kind: "",
+    platform: "",
   },
   scanFilters: {
     keyword: "",
@@ -626,6 +625,64 @@ function getScanDetailModal() {
   return document.getElementById("scan-detail-modal");
 }
 
+function getDashboardOverlayModal() {
+  return document.getElementById("dashboard-overlay-modal");
+}
+
+function isMobileViewport() {
+  return window.matchMedia("(max-width: 960px)").matches;
+}
+
+function applySidebarCollapsedState(collapsed) {
+  document.body.classList.toggle("sidebar-collapsed", Boolean(collapsed) && !isMobileViewport());
+  const toggleButton = document.getElementById("sidebar-toggle");
+  if (toggleButton) {
+    const expanded = !Boolean(collapsed) || isMobileViewport();
+    toggleButton.textContent = expanded ? "收拢" : "展开";
+    toggleButton.setAttribute("aria-expanded", String(expanded));
+  }
+}
+
+function loadSidebarCollapsedState() {
+  const stored = window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY);
+  applySidebarCollapsedState(stored === "true");
+}
+
+function toggleSidebarCollapsedState() {
+  const willCollapse = !document.body.classList.contains("sidebar-collapsed");
+  window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(willCollapse));
+  applySidebarCollapsedState(willCollapse);
+}
+
+function setMobileSidebarOpen(open) {
+  const isMobile = isMobileViewport();
+  const shouldOpen = Boolean(open) && isMobile;
+  document.body.classList.toggle("mobile-sidebar-open", shouldOpen);
+  const backdrop = document.getElementById("sidebar-backdrop");
+  if (backdrop) {
+    backdrop.hidden = !shouldOpen;
+  }
+  const mobileToggle = document.getElementById("mobile-sidebar-toggle");
+  if (mobileToggle) {
+    mobileToggle.setAttribute("aria-expanded", String(shouldOpen));
+  }
+}
+
+function syncSidebarResponsiveState() {
+  if (isMobileViewport()) {
+    document.body.classList.remove("sidebar-collapsed");
+    setMobileSidebarOpen(false);
+    const toggleButton = document.getElementById("sidebar-toggle");
+    if (toggleButton) {
+      toggleButton.textContent = "收拢";
+      toggleButton.setAttribute("aria-expanded", "true");
+    }
+    return;
+  }
+  setMobileSidebarOpen(false);
+  loadSidebarCollapsedState();
+}
+
 function creatorDisplayName(item) {
   return item.mark || item.name;
 }
@@ -917,6 +974,124 @@ function openCreatorDetailFromDashboard(creatorId) {
     });
 }
 
+function closeDashboardOverlayModal() {
+  closeModal(getDashboardOverlayModal());
+}
+
+function renderDashboardOverlayCards(items, mode) {
+  if (!Array.isArray(items) || !items.length) {
+    return `<article class="list-card dashboard-overlay-empty"><small>当前没有可显示的内容。</small></article>`;
+  }
+  if (mode === "running-tasks") {
+    return items.map((item) => {
+      const totalCount = Math.max(0, Number(item.total_count || 0));
+      const completedCount = Math.max(0, Number(item.completed_count || 0));
+      const progressPercent = Math.max(0, Math.min(100, Number(item.progress_percent || 0)));
+      return `
+        <article class="list-card compact-card dashboard-overlay-card" role="button" tabindex="0" data-dashboard-overlay-creator="${item.creator_id}">
+          <header>
+            <div>
+              <strong>${escapeHtml(item.creator_name || `账号 ${item.creator_id}`)}</strong>
+              <span class="subtle-text">${escapeHtml(item.platform || "")}${item.mode === "auto_detail_download" ? " 自动下载" : item.mode === "auto_creator_batch_download" ? " 自动整号下载" : ""}</span>
+            </div>
+            <span class="pill pill-accent">执行中</span>
+          </header>
+          <p>${escapeHtml(item.target_folder_name || item.message || "任务执行中")}</p>
+          <div class="compact-meta">
+            <span class="pill">已完成 ${completedCount} / ${totalCount || "?"}</span>
+            <span class="pill">进度 ${progressPercent}%</span>
+          </div>
+        </article>
+      `;
+    }).join("");
+  }
+  return items.map((item) => {
+    const autoEnabled = Boolean(item.auto_download_enabled);
+    const liveAutoState = getCreatorLiveAutoState(item);
+    const autoResultMeta = getAutoResultMeta(liveAutoState.status);
+    const autoScheduleText = autoEnabled
+      ? `下次执行：${escapeHtml(item.auto_download_next_run_at || "(等待计划)")}`
+      : "下次执行：已关闭";
+    return `
+      <article class="list-card creator-card dashboard-overlay-card" role="button" tabindex="0" data-dashboard-overlay-creator="${item.id}">
+        <header>
+          <div>
+            <strong>${escapeHtml(creatorDisplayName(item))}</strong>
+            <span class="creator-alias">${escapeHtml(item.mark && item.mark !== item.name ? item.name : profileNameById(item.profile_id ?? 1))}</span>
+          </div>
+          <span class="pill">${escapeHtml(item.platform || "")}</span>
+        </header>
+        <div class="creator-meta">
+          <span class="pill">${item.enabled ? "启用" : "停用"}</span>
+          <span class="pill">${escapeHtml(profileNameById(item.profile_id ?? 1))}</span>
+          <span class="pill ${autoEnabled ? "pill-accent" : "pill-muted"}">${escapeHtml(autoEnabled ? formatIntervalLabel(item.auto_download_interval_minutes) : "自动关闭")}</span>
+          <span class="pill ${autoResultMeta.pillClass}">${escapeHtml(autoResultMeta.label)}</span>
+        </div>
+        <small class="creator-schedule-line ${autoEnabled ? "creator-schedule-line-active" : ""}">${autoScheduleText}</small>
+      </article>
+    `;
+  }).join("");
+}
+
+function bindDashboardOverlayCards() {
+  document.querySelectorAll("[data-dashboard-overlay-creator]").forEach((card) => {
+    const openDetail = () => openCreatorDetailFromDashboard(card.dataset.dashboardOverlayCreator);
+    card.addEventListener("click", openDetail);
+    card.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") {
+        return;
+      }
+      event.preventDefault();
+      openDetail();
+    });
+  });
+}
+
+function openDashboardOverlayModal({ title, description, items, mode }) {
+  const titleElement = document.getElementById("dashboard-overlay-title");
+  const descriptionElement = document.getElementById("dashboard-overlay-description");
+  const contentElement = document.getElementById("dashboard-overlay-content");
+  if (!titleElement || !descriptionElement || !contentElement) {
+    return;
+  }
+  titleElement.textContent = title;
+  descriptionElement.textContent = description;
+  contentElement.innerHTML = renderDashboardOverlayCards(items, mode);
+  openModal(getDashboardOverlayModal());
+  bindDashboardOverlayCards();
+}
+
+async function openAutoCreatorsOverlay() {
+  await loadCreators();
+  const items = (state.creators || []).filter((item) => Boolean(item.auto_download_enabled));
+  openDashboardOverlayModal({
+    title: "已开启自动下载的账号",
+    description: "在总览页直接查看自动下载账号，点击卡片可继续查看账号详情。",
+    items,
+    mode: "creators",
+  });
+}
+
+async function openFailedCreatorsOverlay() {
+  await loadCreators();
+  const items = (state.creators || []).filter((item) => String(getCreatorLiveAutoState(item).status || "").toLowerCase() === "failed");
+  openDashboardOverlayModal({
+    title: "最近执行失败的账号",
+    description: "展示最近状态为失败的账号，点击卡片可继续查看账号详情。",
+    items,
+    mode: "creators",
+  });
+}
+
+function openRunningTasksOverlay() {
+  openDashboardOverlayModal({
+    title: "运行中的自动任务",
+    description: "展示当前正在下载中的账号任务，点击卡片可继续查看账号详情。",
+    items: Array.isArray(state.runningTaskCards) ? state.runningTaskCards : [],
+    mode: "running-tasks",
+  });
+}
+
 function renderHealth(data = state.health) {
   if (!data) {
     return;
@@ -1007,28 +1182,19 @@ function renderHealth(data = state.health) {
 
   document.querySelectorAll("[data-dashboard-action='auto-creators']").forEach((button) => {
     button.addEventListener("click", () => {
-      focusCreatorsWithFilters({
-        autoEnabled: "true",
-        autoStatus: "",
-      });
+      runLockedAction("dashboard:auto-creators", openAutoCreatorsOverlay);
     });
   });
 
   document.querySelectorAll("[data-dashboard-action='running-auto-tasks']").forEach((button) => {
     button.addEventListener("click", () => {
-      focusTasksWithFilters({
-        kind: "auto",
-        status: "running",
-      });
+      openRunningTasksOverlay();
     });
   });
 
   document.querySelectorAll("[data-dashboard-action='failed-creators']").forEach((button) => {
     button.addEventListener("click", () => {
-      focusCreatorsWithFilters({
-        autoEnabled: "true",
-        autoStatus: "failed",
-      });
+      runLockedAction("dashboard:failed-creators", openFailedCreatorsOverlay);
     });
   });
 
@@ -1296,7 +1462,8 @@ function closeModal(element) {
     getCreatorDetailModal().hidden &&
     getProfileModal().hidden &&
     getProfileDetailModal().hidden &&
-    getScanDetailModal().hidden
+    getScanDetailModal().hidden &&
+    getDashboardOverlayModal().hidden
   ) {
     document.body.style.overflow = "";
   }
@@ -1728,7 +1895,7 @@ function renderProfiles() {
   `;
   document.getElementById("creator-filter-profile").value = state.creatorFilters.profileId;
   document.getElementById("creator-filter-auto").value = state.creatorFilters.autoEnabled;
-  document.getElementById("creator-filter-auto-status").value = state.creatorFilters.autoStatus;
+  document.getElementById("creator-filter-download-status").value = state.creatorFilters.downloadStatus;
 
   const profiles = filteredProfiles();
   const pageData = paginateItems("profiles", profiles);
@@ -1937,16 +2104,17 @@ function renderCreators() {
       if (purgeHistory) {
         const result = await request(`/creators/${creatorId}/delete-with-history`, {
           method: "POST",
+          timeoutMs: 120000,
         });
         notify(
           `${creatorDisplayName(creator || { name: `账号 ${creatorId}` })} 已删除，并清理 ${result.deleted_download_records ?? 0} 条下载记录（识别作品 ${result.resolved_work_ids ?? 0} 个）。`,
           "success",
         );
       } else {
-        await request(`/creators/${creatorId}`, { method: "DELETE" });
+        await request(`/creators/${creatorId}`, { method: "DELETE", timeoutMs: 120000 });
         notify(`${creatorDisplayName(creator || { name: `账号 ${creatorId}` })} 已删除。`, "success");
       }
-      await loadCreators();
+      await loadCreators(true);
       await loadCreatorOptions();
       await withLoaderLock("load:tasks", loadTasks);
       await loadPollState();
@@ -2092,17 +2260,9 @@ function renderTasks() {
   if (pageSizeSelect) {
     pageSizeSelect.value = String(state.pagination.tasks.pageSize);
   }
-  const statusSelect = document.getElementById("task-filter-status");
-  const modeSelect = document.getElementById("task-filter-mode");
-  const kindSelect = document.getElementById("task-filter-kind");
-  if (statusSelect) {
-    statusSelect.value = state.taskFilters.status;
-  }
-  if (modeSelect) {
-    modeSelect.value = state.taskFilters.mode;
-  }
-  if (kindSelect) {
-    kindSelect.value = state.taskFilters.kind;
+  const platformSelect = document.getElementById("task-filter-platform");
+  if (platformSelect) {
+    platformSelect.value = state.taskFilters.platform;
   }
   const pageData = {
     items: state.taskPage.items || [],
@@ -2258,7 +2418,7 @@ async function loadLatestScan() {
   }));
 }
 
-async function loadCreators() {
+async function loadCreators(force = false) {
   const query = new URLSearchParams({
     page: String(state.pagination.creators.page),
     page_size: String(state.pagination.creators.pageSize),
@@ -2278,12 +2438,12 @@ async function loadCreators() {
   if (state.creatorFilters.autoEnabled) {
     query.set("auto_enabled", state.creatorFilters.autoEnabled);
   }
-  if (state.creatorFilters.autoStatus) {
-    query.set("auto_status", state.creatorFilters.autoStatus);
+  if (state.creatorFilters.downloadStatus) {
+    query.set("download_status", state.creatorFilters.downloadStatus);
   }
   const data = await request(`/creators?${query.toString()}`);
   const snapshot = buildCreatorsSnapshot(data);
-  if (snapshot === state.snapshots.creators) {
+  if (!force && snapshot === state.snapshots.creators) {
     return;
   }
   state.snapshots.creators = snapshot;
@@ -2296,7 +2456,6 @@ async function loadCreators() {
   };
   state.pagination.creators.page = state.creatorPage.page;
   state.pagination.creators.pageSize = state.creatorPage.page_size;
-  await loadCreatorOptions();
   if (state.editingCreatorId && !state.creators.some((item) => item.id === state.editingCreatorId)) {
     state.editingCreatorId = null;
   }
@@ -2321,14 +2480,8 @@ async function loadTasks() {
   if (state.taskFilters.keyword) {
     query.set("keyword", state.taskFilters.keyword);
   }
-  if (state.taskFilters.status) {
-    query.set("status", state.taskFilters.status);
-  }
-  if (state.taskFilters.mode) {
-    query.set("mode", state.taskFilters.mode);
-  }
-  if (state.taskFilters.kind) {
-    query.set("kind", state.taskFilters.kind);
+  if (state.taskFilters.platform) {
+    query.set("platform", state.taskFilters.platform);
   }
   const data = await request(`/tasks/summary?${query.toString()}`);
   const snapshot = buildTasksSnapshot(data);
@@ -2414,7 +2567,6 @@ async function loadPollState() {
   if (creatorDigest !== state.digests.creators) {
     state.digests.creators = creatorDigest;
     await loadCreators();
-    await loadCreatorOptions();
   }
 
   const taskDigest = buildDigestSnapshot(data.digests?.tasks);
@@ -2470,7 +2622,29 @@ function bindNavigation() {
   document.querySelectorAll(".nav-link").forEach((button) => {
     button.addEventListener("click", () => {
       switchView(button.dataset.view);
+      if (isMobileViewport()) {
+        setMobileSidebarOpen(false);
+      }
     });
+  });
+
+  document.getElementById("sidebar-toggle")?.addEventListener("click", () => {
+    if (isMobileViewport()) {
+      return;
+    }
+    toggleSidebarCollapsedState();
+  });
+
+  document.getElementById("mobile-sidebar-toggle")?.addEventListener("click", () => {
+    setMobileSidebarOpen(!document.body.classList.contains("mobile-sidebar-open"));
+  });
+
+  document.getElementById("sidebar-backdrop")?.addEventListener("click", () => {
+    setMobileSidebarOpen(false);
+  });
+
+  window.addEventListener("resize", () => {
+    syncSidebarResponsiveState();
   });
 }
 
@@ -2911,7 +3085,7 @@ function bindActions() {
     notify("已同步到引擎 settings.json。", "success");
   }));
 
-  document.getElementById("refresh-creators").addEventListener("click", () => runLockedAction("refresh:creators", loadCreators));
+  document.getElementById("refresh-creators").addEventListener("click", () => runLockedAction("refresh:creators", () => loadCreators(true)));
   document.getElementById("refresh-profiles").addEventListener("click", () => runLockedAction("refresh:profiles", loadProfiles));
   document.getElementById("refresh-tasks").addEventListener("click", () => runLockedAction("refresh:tasks", () => withLoaderLock("load:tasks", loadTasks)));
 
@@ -2960,8 +3134,8 @@ function bindActions() {
     });
   });
 
-  document.getElementById("creator-filter-auto-status").addEventListener("change", (event) => {
-    state.creatorFilters.autoStatus = event.currentTarget.value;
+  document.getElementById("creator-filter-download-status").addEventListener("change", (event) => {
+    state.creatorFilters.downloadStatus = event.currentTarget.value;
     state.pagination.creators.page = 1;
     loadCreators().catch((error) => {
       console.error(error);
@@ -2990,26 +3164,8 @@ function bindActions() {
     });
   });
 
-  document.getElementById("task-filter-status").addEventListener("change", (event) => {
-    state.taskFilters.status = event.currentTarget.value;
-    state.pagination.tasks.page = 1;
-    withLoaderLock("load:tasks", loadTasks).catch((error) => {
-      console.error(error);
-      notify(formatError(error), "error");
-    });
-  });
-
-  document.getElementById("task-filter-mode").addEventListener("change", (event) => {
-    state.taskFilters.mode = event.currentTarget.value;
-    state.pagination.tasks.page = 1;
-    withLoaderLock("load:tasks", loadTasks).catch((error) => {
-      console.error(error);
-      notify(formatError(error), "error");
-    });
-  });
-
-  document.getElementById("task-filter-kind").addEventListener("change", (event) => {
-    state.taskFilters.kind = event.currentTarget.value;
+  document.getElementById("task-filter-platform").addEventListener("change", (event) => {
+    state.taskFilters.platform = event.currentTarget.value;
     state.pagination.tasks.page = 1;
     withLoaderLock("load:tasks", loadTasks).catch((error) => {
       console.error(error);
@@ -3070,6 +3226,10 @@ function bindActions() {
         closeScanDetailModal();
         return;
       }
+      if (element.dataset.closeModal === "dashboard-overlay") {
+        closeDashboardOverlayModal();
+        return;
+      }
     });
   });
 
@@ -3092,6 +3252,9 @@ function bindActions() {
     if (!getScanDetailModal().hidden) {
       closeScanDetailModal();
     }
+    if (!getDashboardOverlayModal().hidden) {
+      closeDashboardOverlayModal();
+    }
     closeProfileNameFormatPicker();
   });
 
@@ -3109,6 +3272,8 @@ function bindActions() {
 }
 
 async function bootstrap() {
+  loadSidebarCollapsedState();
+  syncSidebarResponsiveState();
   bindNavigation();
   bindForms();
   bindActions();
@@ -3120,8 +3285,8 @@ async function bootstrap() {
   await loadRiskGuardStatus();
   await loadEngineConfig();
   await loadProfiles();
-  await loadCreatorOptions();
   await loadCreators();
+  await loadCreatorOptions();
   await loadPollState();
   scheduleBackgroundPolling();
 
@@ -3200,5 +3365,3 @@ startApplication().catch((error) => {
     notify(`面板启动失败：${formatError(error)}`, "error");
   }
 });
-
-

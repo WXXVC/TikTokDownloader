@@ -336,3 +336,44 @@ class DownloadTaskCreate(BaseModel):
 class DownloadWorksTaskCreate(BaseModel):
     creator_id: int
     work_ids: list[str] = Field(min_length=1)
+
+
+class CreatorScriptUpsertRequest(BaseModel):
+    password: str = Field(min_length=1)
+    url: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=100)
+    platform: str = ""
+    mark: str = ""
+    tab: str | None = None
+    profile_id: int | None = None
+    enabled: bool | None = None
+    auto_download_enabled: bool | None = None
+    auto_download_interval_minutes: int | None = None
+    sec_user_id: str = ""
+    only_check: bool = False
+
+
+class CreatorScriptUpsertResponse(BaseModel):
+    ok: bool = True
+    status: str
+    message: str
+    exists: bool = False
+    creator: CreatorRead | None = None
+
+
+class CreatorScriptHistoryRequest(BaseModel):
+    password: str = Field(min_length=1)
+
+
+class CreatorScriptHistoryItem(BaseModel):
+    id: int
+    platform: str
+    name: str
+    mark: str = ""
+    url: str
+
+
+class CreatorScriptHistoryResponse(BaseModel):
+    ok: bool = True
+    total: int = 0
+    items: list[CreatorScriptHistoryItem] = Field(default_factory=list)

@@ -9,6 +9,10 @@ from ..schemas import (
     CreatorQuickAddBatchResponse,
     CreatorQuickAddRequest,
     CreatorRead,
+    CreatorScriptHistoryRequest,
+    CreatorScriptHistoryResponse,
+    CreatorScriptUpsertRequest,
+    CreatorScriptUpsertResponse,
     CreatorUpdate,
 )
 from ..services import creators as service
@@ -28,7 +32,7 @@ def list_creators(
     profile_id: int | None = Query(default=None),
     enabled: str = Query(default=""),
     auto_enabled: str = Query(default=""),
-    auto_status: str = Query(default=""),
+    download_status: str = Query(default=""),
 ):
     return service.list_creator_page(
         page=page,
@@ -38,7 +42,7 @@ def list_creators(
         profile_id=profile_id,
         enabled=enabled,
         auto_enabled=auto_enabled,
-        auto_status=auto_status,
+        download_status=download_status,
     )
 
 
@@ -57,9 +61,23 @@ def create_creator(payload: CreatorCreate):
     return service.create_creator(payload)
 
 
-@router.post("/quick-add", response_model=CreatorQuickAddBatchResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/quick-add",
+    response_model=CreatorQuickAddBatchResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def quick_add_creator(payload: CreatorQuickAddRequest):
     return service.create_creator_via_quick_add(payload)
+
+
+@router.post("/script-upsert", response_model=CreatorScriptUpsertResponse)
+def script_upsert_creator(payload: CreatorScriptUpsertRequest):
+    return service.upsert_creator_from_script(payload.model_dump(exclude_unset=True))
+
+
+@router.post("/script-history", response_model=CreatorScriptHistoryResponse)
+def script_creator_history(payload: CreatorScriptHistoryRequest):
+    return service.list_creator_history_for_script(payload.password)
 
 
 @router.put("/{creator_id}", response_model=CreatorRead)
@@ -88,7 +106,9 @@ def reset_creator_schedule(creator_id: int):
 
 
 @router.post("/{creator_id}/clear-task-records")
-def clear_creator_task_records(creator_id: int, purge_download_history: bool = Query(default=False)):
+def clear_creator_task_records(
+    creator_id: int, purge_download_history: bool = Query(default=False)
+):
     return task_service.clear_creator_task_records(
         creator_id,
         purge_download_history=purge_download_history,

@@ -31,17 +31,13 @@ def list_task_center_summary(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=100, ge=1, le=500),
     keyword: str = Query(default=""),
-    status: str = Query(default=""),
-    mode: str = Query(default=""),
-    kind: str = Query(default=""),
+    platform: str = Query(default=""),
 ):
     return service.list_task_center_summary_page(
         page=page,
         page_size=page_size,
         keyword=keyword,
-        status=status,
-        mode=mode,
-        kind=kind,
+        platform=platform,
     )
 
 
